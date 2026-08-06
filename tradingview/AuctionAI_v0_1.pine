@@ -2,69 +2,91 @@
 indicator("AuctionAI v0.1 - Decision Support System", overlay=true)
 
 //==================================================
-// AuctionAI Sprint 1
-// Core philosophy:
+// AuctionAI Sprint 1.1
+// Context Engine Foundation
 // Context > Evidence
-// This version creates the foundation for:
-// Context, Delta, CVD, Effort vs Result, Initiative/Responsive
 //==================================================
 
-//-------------------------
-// Inputs
-//-------------------------
 showPanel = input.bool(true, "Show AuctionAI Panel")
-context = input.string("BALANCE", "Market Context", options=["TREND", "BALANCE", "REJECTION"])
-weeklyBias = input.string("NEUTRAL", "Higher Timeframe Bias", options=["BULL", "BEAR", "NEUTRAL"])
-marketState = input.string("SEARCHING", "Auction State", options=["ACCEPTING", "REJECTING", "SEARCHING"])
-
-contextScore = input.int(0, "Context Score", minval=-10, maxval=10)
-deltaScore = input.int(0, "Delta Score", minval=-10, maxval=10)
-cvdScore = input.int(0, "CVD Score", minval=-10, maxval=10)
-effortScore = input.int(0, "Effort vs Result", minval=-10, maxval=10)
-initiativeScore = input.int(0, "Initiative / Responsive", minval=-10, maxval=10)
+lookback = input.int(50, "Context Lookback")
 
 //-------------------------
-// Weight Engine
+// Context Engine
 //-------------------------
-confidence = (contextScore * 0.40) + (initiativeScore * 0.20) + (deltaScore * 0.15) + (cvdScore * 0.15) + (effortScore * 0.10)
+highRange = ta.highest(high, lookback)
+lowRange  = ta.lowest(low, lookback)
+rangeSize = highRange - lowRange
 
-confidence10 = math.round((confidence + 10) / 2 * 10) / 10
+positionInRange = rangeSize != 0 ? (close - lowRange) / rangeSize : 0.5
+
+string location = "MID VALUE"
+if positionInRange > 0.75
+    location := "UPPER VALUE"
+else if positionInRange < 0.25
+    location := "LOWER VALUE"
+
+atr = ta.atr(14)
+expansion = math.abs(close - close[10]) > atr * 2
+
+string marketContext = "BALANCE"
+if expansion
+    marketContext := close > close[10] ? "BULL EXPANSION" : "BEAR EXPANSION"
+
+string auctionState = "SEARCHING"
+if expansion
+    auctionState := "TESTING NEW VALUE"
+else
+    auctionState := "BALANCE AUCTION"
+
+//-------------------------
+// Evidence placeholders
+//-------------------------
+// Future engines:
+// Delta
+// CVD
+// Effort vs Result
+// Initiative / Responsive
+
+contextScore = 0
+if marketContext == "BULL EXPANSION"
+    contextScore := 3
+else if marketContext == "BEAR EXPANSION"
+    contextScore := -3
+
+confidence = contextScore * 0.40
+confidence10 = math.round(((confidence + 10) / 2) * 10) / 10
 
 //-------------------------
 // Panel
 //-------------------------
-var table panel = table.new(position.top_right, 2, 10, border_width=1)
+var table panel = table.new(position.top_right, 2, 9, border_width=1)
 
 if barstate.islast and showPanel
-    table.cell(panel, 0, 0, "AuctionAI v0.1")
-    table.cell(panel, 1, 0, "ACTIVE")
+    table.cell(panel,0,0,"AuctionAI v0.1")
+    table.cell(panel,1,0,"ACTIVE")
 
-    table.cell(panel, 0, 1, "Context")
-    table.cell(panel, 1, 1, context)
+    table.cell(panel,0,1,"Context")
+    table.cell(panel,1,1,marketContext)
 
-    table.cell(panel, 0, 2, "HTF Bias")
-    table.cell(panel, 1, 2, weeklyBias)
+    table.cell(panel,0,2,"Location")
+    table.cell(panel,1,2,location)
 
-    table.cell(panel, 0, 3, "Auction")
-    table.cell(panel, 1, 3, marketState)
+    table.cell(panel,0,3,"Auction")
+    table.cell(panel,1,3,auctionState)
 
-    table.cell(panel, 0, 4, "Context 40%")
-    table.cell(panel, 1, 4, str.tostring(contextScore))
+    table.cell(panel,0,4,"Context Score")
+    table.cell(panel,1,4,str.tostring(contextScore))
 
-    table.cell(panel, 0, 5, "Delta 15%")
-    table.cell(panel, 1, 5, str.tostring(deltaScore))
+    table.cell(panel,0,5,"Delta")
+    table.cell(panel,1,5,"Pending")
 
-    table.cell(panel, 0, 6, "CVD 15%")
-    table.cell(panel, 1, 6, str.tostring(cvdScore))
+    table.cell(panel,0,6,"CVD")
+    table.cell(panel,1,6,"Pending")
 
-    table.cell(panel, 0, 7, "Effort 10%")
-    table.cell(panel, 1, 7, str.tostring(effortScore))
+    table.cell(panel,0,7,"Effort/Initiative")
+    table.cell(panel,1,7,"Pending")
 
-    table.cell(panel, 0, 8, "Initiative 20%")
-    table.cell(panel, 1, 8, str.tostring(initiativeScore))
+    table.cell(panel,0,8,"Confidence")
+    table.cell(panel,1,8,str.tostring(confidence10)+"/10")
 
-    table.cell(panel, 0, 9, "Confidence")
-    table.cell(panel, 1, 9, str.tostring(confidence10) + "/10")
-
-// placeholder plot for future engines
 plot(na)
