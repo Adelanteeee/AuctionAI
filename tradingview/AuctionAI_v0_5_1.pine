@@ -1,0 +1,105 @@
+//@version=6
+indicator("AuctionAI v0.5.1 - Decision Engine", overlay=true)
+
+lookback = input.int(50, "Balance Lookback")
+showPanel = input.bool(true, "Show Panel")
+
+rangeHigh = ta.highest(high, lookback)
+rangeLow = ta.lowest(low, lookback)
+rangeSize = rangeHigh - rangeLow
+positionValue = rangeSize != 0 ? (close - rangeLow) / rangeSize : 0.5
+
+location = positionValue > 0.75 ? "UPPER VALUE" : positionValue < 0.25 ? "LOWER VALUE" : "MID VALUE"
+
+attempt = close > rangeHigh ? "BREAKOUT UP" : close < rangeLow ? "BREAKOUT DOWN" : "NONE"
+
+atr = ta.atr(14)
+body = math.abs(close-open)
+strongBody = body > atr * 0.7
+
+acceptUp = close > rangeHigh and strongBody and close > open
+acceptDown = close < rangeLow and strongBody and close < open
+rejectUp = high > rangeHigh and close < rangeHigh
+rejectDown = low < rangeLow and close > rangeLow
+
+auction = "BALANCE AUCTION"
+decision = "WAITING"
+hypothesis = "Searching"
+
+if acceptUp
+    auction := "NEW VALUE HIGHER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Buyer"
+else if acceptDown
+    auction := "NEW VALUE LOWER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Seller"
+else if rejectUp
+    auction := "FAILED AUCTION"
+    decision := "REJECTION"
+    hypothesis := "Responsive Seller Possible"
+else if rejectDown
+    auction := "FAILED AUCTION"
+    decision := "REJECTION"
+    hypothesis := "Responsive Buyer Possible"
+
+contextScore = acceptUp ? 5 : acceptDown ? -5 : rejectDown ? 2 : rejectUp ? -2 : 0
+
+volumeAvg = ta.sma(volume,20)
+effort = volume > volumeAvg ? "HIGH" : "LOW"
+result = math.abs(close-close[1]) > atr*0.5 ? "HIGH" : "LOW"
+
+reading = effort == "HIGH" and result == "LOW" ? "Possible Absorption" : "Normal Result"
+
+buyPressure = ((close-low)/(high-low))*100
+sellPressure = ((high-close)/(high-low))*100
+
+deltaProxy = buyPressure - sellPressure
+cvdBias = ta.ema(deltaProxy,20) > ta.ema(deltaProxy,50) ? "RISING" : "FALLING"
+
+tradeState = "WAIT"
+reason = "Need More Information"
+
+if decision == "ACCEPTED" and reading == "Normal Result"
+    tradeState := "ALLOWED"
+    reason := "Acceptance Confirmed"
+else if reading == "Possible Absorption"
+    tradeState := "WAIT"
+    reason := "High Effort Low Result"
+
+var table panel = table.new(position.top_right,2,18)
+
+if barstate.islast and showPanel
+    table.cell(panel,0,0,"AuctionAI v0.5.1")
+    table.cell(panel,1,0,"ACTIVE")
+    table.cell(panel,0,1,"Location")
+    table.cell(panel,1,1,location)
+    table.cell(panel,0,2,"Attempt")
+    table.cell(panel,1,2,attempt)
+    table.cell(panel,0,3,"Auction")
+    table.cell(panel,1,3,auction)
+    table.cell(panel,0,4,"Decision")
+    table.cell(panel,1,4,decision)
+    table.cell(panel,0,5,"Hypothesis")
+    table.cell(panel,1,5,hypothesis)
+    table.cell(panel,0,6,"Context Score")
+    table.cell(panel,1,6,str.tostring(contextScore))
+    table.cell(panel,0,7,"Effort")
+    table.cell(panel,1,7,effort)
+    table.cell(panel,0,8,"Result")
+    table.cell(panel,1,8,result)
+    table.cell(panel,0,9,"Reading")
+    table.cell(panel,1,9,reading)
+    table.cell(panel,0,10,"Delta Proxy")
+    table.cell(panel,1,10,str.tostring(math.round(deltaProxy)))
+    table.cell(panel,0,11,"CVD Bias")
+    table.cell(panel,1,11,cvdBias)
+    table.cell(panel,0,12,"Divergence")
+    table.cell(panel,1,12,"Pending")
+    table.cell(panel,0,13,"Trade State")
+    table.cell(panel,1,13,tradeState)
+    table.cell(panel,0,14,"Reason")
+    table.cell(panel,1,14,reason)
+
+plot(rangeHigh,"Balance High")
+plot(rangeLow,"Balance Low")
