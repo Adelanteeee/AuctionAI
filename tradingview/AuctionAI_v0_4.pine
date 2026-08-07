@@ -1,0 +1,135 @@
+//@version=6
+indicator("AuctionAI v0.4 - Order Flow Evidence Layer", overlay=true)
+
+// Sprint 1.4
+// Context -> Auction -> Effort/Result -> Order Flow Evidence
+
+showPanel = input.bool(true, "Show AuctionAI Panel")
+lookback = input.int(50, "Balance Lookback")
+
+//-------------------------
+// Context Layer
+//-------------------------
+rangeHigh = ta.highest(high, lookback)
+rangeLow  = ta.lowest(low, lookback)
+rangeSize = rangeHigh - rangeLow
+pos = rangeSize != 0 ? (close-rangeLow)/rangeSize : 0.5
+
+location = pos > 0.75 ? "UPPER VALUE" : pos < 0.25 ? "LOWER VALUE" : "MID VALUE"
+
+attempt = "NONE"
+if close > rangeHigh
+    attempt := "BREAKOUT UP"
+else if close < rangeLow
+    attempt := "BREAKOUT DOWN"
+
+//-------------------------
+// Auction Decision
+//-------------------------
+atr = ta.atr(14)
+body = math.abs(close-open)
+strongBody = body > atr * 0.7
+
+acceptUp = close > rangeHigh and strongBody
+acceptDown = close < rangeLow and strongBody
+
+auction = "BALANCE AUCTION"
+decision = "WAITING"
+hypothesis = "Searching For Value"
+
+if acceptUp
+    auction := "NEW VALUE HIGHER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Buyer Possible"
+else if acceptDown
+    auction := "NEW VALUE LOWER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Seller Possible"
+
+//-------------------------
+// Effort vs Result
+//-------------------------
+volHigh = volume > ta.sma(volume,20)
+rangeHighResult = (high-low) > atr
+
+effortResult = "NORMAL"
+reading = "Balanced Activity"
+
+if volHigh and not rangeHighResult
+    effortResult := "HIGH EFFORT LOW RESULT"
+    reading := "Possible Absorption"
+else if volHigh and rangeHighResult
+    effortResult := "HIGH EFFORT HIGH RESULT"
+    reading := "Initiative Activity"
+
+//-------------------------
+// Delta Proxy
+//-------------------------
+pressure = ((close-low)/(high-low+syminfo.mintick))*100
+
+delta = pressure > 60 ? "BUY PRESSURE" : pressure < 40 ? "SELL PRESSURE" : "NEUTRAL"
+
+//-------------------------
+// CVD Proxy
+//-------------------------
+cvdValue = ta.cum(close > open ? volume : -volume)
+
+cvdBias = cvdValue > cvdValue[1] ? "RISING" : "FALLING"
+
+//-------------------------
+// Divergence
+//-------------------------
+bearDiv = high > high[5] and cvdValue < cvdValue[5]
+bullDiv = low < low[5] and cvdValue > cvdValue[5]
+
+divergence = bearDiv ? "BEARISH" : bullDiv ? "BULLISH" : "NONE"
+
+//-------------------------
+// Score
+//-------------------------
+contextScore = 0
+contextScore += location == "UPPER VALUE" ? 1 : location == "LOWER VALUE" ? -1 : 0
+contextScore += acceptUp ? 2 : acceptDown ? -2 : 0
+contextScore += effortResult == "HIGH EFFORT LOW RESULT" ? -1 : 1
+
+//-------------------------
+// Panel
+//-------------------------
+var table panel = table.new(position.top_right,2,16,border_width=1)
+
+if barstate.islast and showPanel
+    table.cell(panel,0,0,"AuctionAI v0.4")
+    table.cell(panel,1,0,"ACTIVE")
+    table.cell(panel,0,1,"Location")
+    table.cell(panel,1,1,location)
+    table.cell(panel,0,2,"Attempt")
+    table.cell(panel,1,2,attempt)
+    table.cell(panel,0,3,"Auction")
+    table.cell(panel,1,3,auction)
+    table.cell(panel,0,4,"Decision")
+    table.cell(panel,1,4,decision)
+    table.cell(panel,0,5,"Hypothesis")
+    table.cell(panel,1,5,hypothesis)
+    table.cell(panel,0,6,"Context Score")
+    table.cell(panel,1,6,str.tostring(contextScore))
+    table.cell(panel,0,7,"Effort/Result")
+    table.cell(panel,1,7,effortResult)
+    table.cell(panel,0,8,"Reading")
+    table.cell(panel,1,8,reading)
+    table.cell(panel,0,9,"Delta Proxy")
+    table.cell(panel,1,9,delta)
+    table.cell(panel,0,10,"CVD Bias")
+    table.cell(panel,1,10,cvdBias)
+    table.cell(panel,0,11,"Divergence")
+    table.cell(panel,1,11,divergence)
+    table.cell(panel,0,12,"Delta")
+    table.cell(panel,1,12,"Proxy")
+    table.cell(panel,0,13,"CVD")
+    table.cell(panel,1,13,"Proxy")
+    table.cell(panel,0,14,"Order Flow")
+    table.cell(panel,1,14,"Evidence Layer")
+    table.cell(panel,0,15,"Status")
+    table.cell(panel,1,15,"WAIT")
+
+plot(rangeHigh,"Balance High",color=color.gray)
+plot(rangeLow,"Balance Low",color=color.gray)
