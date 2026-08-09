@@ -1,0 +1,476 @@
+//@version=6
+indicator("AuctionAI v0.6.2 - Acceptance Retest Quality", overlay=true)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+lookback      = input.int(50, "Balance Lookback", minval=5)
+atrLength     = input.int(14, "ATR Length", minval=1)
+volumeLength  = input.int(20, "Volume Average Length", minval=2)
+deltaFastLen  = input.int(20, "Delta Fast Length", minval=2)
+deltaSlowLen  = input.int(50, "Delta Slow Length", minval=3)
+strongBodyATR = input.float(0.7, "Strong Body / ATR", minval=0.1, step=0.1)
+resultATR     = input.float(0.5, "High Result / ATR", minval=0.1, step=0.1)
+showPanel     = input.bool(true, "Show Panel")
+showBalance  = input.bool(true, "Show Balance")
+showSignals   = input.bool(true, "Show Decision Signals")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 1. CONTEXT / BALANCE
+// Balance is the area where the auction searches for new value.
+// IMPORTANT: use the PREVIOUS completed range so the current candle can
+// actually attempt to leave the balance.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+rangeHigh = ta.highest(high, lookback)[1]
+rangeLow  = ta.lowest(low, lookback)[1]
+rangeSize = rangeHigh - rangeLow
+
+positionValue = rangeSize > 0 ? (close - rangeLow) / rangeSize : 0.5
+
+location =
+     positionValue > 0.75 ? "UPPER VALUE" :
+     positionValue < 0.25 ? "LOWER VALUE" :
+     "MID VALUE"
+
+context =
+     positionValue > 0.75 ? "UPPER" :
+     positionValue < 0.25 ? "LOWER" :
+     "BALANCE"
+
+inBalance = close <= rangeHigh and close >= rangeLow
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 2. CANDLE / ATTEMPT
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+atr = ta.atr(atrLength)
+body = math.abs(close - open)
+strongBody = body > atr * strongBodyATR
+
+attemptUp   = high > rangeHigh
+attemptDown = low < rangeLow
+
+attempt =
+     attemptUp and attemptDown ? "TWO-SIDED ATTEMPT" :
+     attemptUp ? "BREAKOUT UP" :
+     attemptDown ? "BREAKOUT DOWN" :
+     "NONE"
+
+// Close outside the previous balance = actual breakout.
+// A wick outside with close back inside = rejection attempt.
+breakoutUp   = close > rangeHigh
+breakoutDown = close < rangeLow
+
+rejectUp   = high > rangeHigh and close <= rangeHigh
+rejectDown = low < rangeLow and close >= rangeLow
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 3. EFFORT / RESULT
+// Effort = participation.
+// Result = distance achieved.
+// High effort + poor result = possible absorption.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+volumeAvg = ta.sma(volume, volumeLength)
+
+effortHigh = volume > volumeAvg
+resultHigh = math.abs(close - close[1]) > atr * resultATR
+
+effort = effortHigh ? "HIGH" : "LOW"
+result = resultHigh ? "HIGH" : "LOW"
+
+effortResult =
+     effortHigh and resultHigh ? "HIGH EFFORT / HIGH RESULT" :
+     effortHigh and not resultHigh ? "HIGH EFFORT / LOW RESULT" :
+     not effortHigh and resultHigh ? "LOW EFFORT / HIGH RESULT" :
+     "LOW EFFORT / LOW RESULT"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4. DELTA / CVD PROXY
+// TradingView standard volume does not provide true bid/ask delta on every
+// symbol. This uses candle-position volume as a transparent proxy.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+barRange = math.max(high - low, syminfo.mintick)
+
+buyPressure  = ((close - low) / barRange) * 100.0
+sellPressure = ((high - close) / barRange) * 100.0
+
+deltaProxy = buyPressure - sellPressure
+cvdProxy   = ta.cum(deltaProxy)
+
+deltaFast = ta.ema(deltaProxy, deltaFastLen)
+deltaSlow = ta.ema(deltaProxy, deltaSlowLen)
+
+cvdBias =
+     deltaFast > deltaSlow ? "RISING" :
+     deltaFast < deltaSlow ? "FALLING" :
+     "FLAT"
+
+deltaDirection =
+     deltaProxy > 0 ? "BUYER" :
+     deltaProxy < 0 ? "SELLER" :
+     "NEUTRAL"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5. ABSORPTION READING
+// High effort + low result is the core absorption warning.
+// Direction is inferred from the candle/delta side.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+possibleAbsorption = effortHigh and not resultHigh
+
+absorptionReading =
+     possibleAbsorption and deltaProxy > 0 and close <= open ?
+         "BUYING ABSORBED" :
+     possibleAbsorption and deltaProxy < 0 and close >= open ?
+         "SELLING ABSORBED" :
+     possibleAbsorption ?
+         "POSSIBLE ABSORPTION" :
+     "NO ABSORPTION"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 6. INITIATIVE / RESPONSIVE
+// Initiative = price attempts to discover value outside balance.
+// Responsive = price rejects an excursion and returns toward value.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+initiativeUp =
+     breakoutUp and strongBody and deltaProxy > 0
+
+initiativeDown =
+     breakoutDown and strongBody and deltaProxy < 0
+
+responsiveUp =
+     rejectUp and deltaProxy < 0
+
+responsiveDown =
+     rejectDown and deltaProxy > 0
+
+participation =
+     initiativeUp ? "INITIATIVE BUYER" :
+     initiativeDown ? "INITIATIVE SELLER" :
+     responsiveUp ? "RESPONSIVE SELLER" :
+     responsiveDown ? "RESPONSIVE BUYER" :
+     "NEUTRAL"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 7. ACCEPTANCE / REJECTION
+// Breakout alone is NOT acceptance.
+// Acceptance requires close outside balance + strong result + aligned delta.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+acceptUp =
+     breakoutUp and
+     strongBody and
+     resultHigh and
+     deltaProxy > 0
+
+acceptDown =
+     breakoutDown and
+     strongBody and
+     resultHigh and
+     deltaProxy < 0
+
+rejectionUp =
+     rejectUp and not acceptUp
+
+rejectionDown =
+     rejectDown and not acceptDown
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 8. AUCTION / DECISION / HYPOTHESIS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+auction = "BALANCE AUCTION"
+decision = "WAITING"
+hypothesis = "Searching"
+
+if acceptUp
+    auction := "NEW VALUE HIGHER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Buyer / Acceptance"
+else if acceptDown
+    auction := "NEW VALUE LOWER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Seller / Acceptance"
+else if rejectionUp
+    auction := "FAILED AUCTION UP"
+    decision := "REJECTION"
+    hypothesis := "Responsive Seller / Possible Retest"
+else if rejectionDown
+    auction := "FAILED AUCTION DOWN"
+    decision := "REJECTION"
+    hypothesis := "Responsive Buyer / Possible Retest"
+else if attemptUp
+    auction := "VALUE TEST HIGH"
+    decision := "WAITING"
+    hypothesis := "Wait for Acceptance or Rejection"
+else if attemptDown
+    auction := "VALUE TEST LOW"
+    decision := "WAITING"
+    hypothesis := "Wait for Acceptance or Rejection"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 9. CONTEXT SCORE
+// Score is directional context, not an entry trigger.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+contextScore =
+     acceptUp ? 5 :
+     acceptDown ? -5 :
+     responsiveDown ? 2 :
+     responsiveUp ? -2 :
+     initiativeUp ? 3 :
+     initiativeDown ? -3 :
+     0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 10. TRADE STATE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tradeState = "WAIT"
+reason = "Need More Information"
+
+if acceptUp and not possibleAbsorption
+    tradeState := "ALLOWED LONG"
+    reason := "Acceptance Confirmed"
+else if acceptDown and not possibleAbsorption
+    tradeState := "ALLOWED SHORT"
+    reason := "Acceptance Confirmed"
+else if possibleAbsorption
+    tradeState := "WAIT"
+    reason := "High Effort / Low Result"
+else if rejectionUp
+    tradeState := "WAIT"
+    reason := "Rejection — Wait for Retest"
+else if rejectionDown
+    tradeState := "WAIT"
+    reason := "Rejection — Wait for Retest"
+else if attemptUp or attemptDown
+    tradeState := "WAIT"
+    reason := "Breakout Attempt — Acceptance Pending"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 11.0 RETEST QUALITY / ACCEPTANCE CONFIRMATION
+// Improvement layer:
+//  - acceptance must persist for N completed bars
+//  - retest quality requires directional delta alignment
+//  - high-effort/low-result retests are treated as caution, not confirmation
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+acceptBarsRequired = input.int(2, "Acceptance Confirmation Bars", minval=1, maxval=5)
+retestDeltaMin = input.float(5.0, "Retest Delta Alignment Threshold", minval=0.0, step=1.0)
+
+var int upAcceptanceBars = 0
+var int downAcceptanceBars = 0
+
+upAcceptanceBars :=
+     close > rangeHigh and
+     strongBody and
+     resultHigh and
+     deltaProxy > 0 ?
+     upAcceptanceBars + 1 : 0
+
+downAcceptanceBars :=
+     close < rangeLow and
+     strongBody and
+     resultHigh and
+     deltaProxy < 0 ?
+     downAcceptanceBars + 1 : 0
+
+confirmedAcceptUp = upAcceptanceBars >= acceptBarsRequired
+confirmedAcceptDown = downAcceptanceBars >= acceptBarsRequired
+
+// A retest is stronger when price returns to the accepted edge but the
+// order-flow proxy remains aligned with the accepted direction.
+retestQualityUp =
+     retestTouchUp and
+     deltaProxy >= retestDeltaMin and
+     not possibleAbsorption
+
+retestQualityDown =
+     retestTouchDown and
+     deltaProxy <= -retestDeltaMin and
+     not possibleAbsorption
+
+weakRetestUp =
+     retestTouchUp and not retestQualityUp
+
+weakRetestDown =
+     retestTouchDown and not retestQualityDown
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 11.1 ACCEPTANCE → RETEST STATE MACHINE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var int acceptedDirection = 0
+var float acceptedLevel = na
+var bool awaitingRetest = false
+var bool retestSeen = false
+var bool retestHold = false
+var bool retestFail = false
+
+if confirmedAcceptUp
+    acceptedDirection := 1
+    acceptedLevel := rangeHigh
+    awaitingRetest := true
+    retestSeen := false
+    retestHold := false
+    retestFail := false
+
+if confirmedAcceptDown
+    acceptedDirection := -1
+    acceptedLevel := rangeLow
+    awaitingRetest := true
+    retestSeen := false
+    retestHold := false
+    retestFail := false
+
+retestTouchUp = awaitingRetest and acceptedDirection == 1 and low <= acceptedLevel and close >= acceptedLevel
+retestTouchDown = awaitingRetest and acceptedDirection == -1 and high >= acceptedLevel and close <= acceptedLevel
+retestFailureUp = awaitingRetest and acceptedDirection == 1 and close < acceptedLevel
+retestFailureDown = awaitingRetest and acceptedDirection == -1 and close > acceptedLevel
+
+if retestQualityUp
+    retestSeen := true
+    retestHold := true
+    retestFail := false
+    awaitingRetest := false
+else if weakRetestUp
+    retestSeen := true
+    retestHold := false
+    retestFail := false
+
+if retestQualityDown
+    retestSeen := true
+    retestHold := true
+    retestFail := false
+    awaitingRetest := false
+else if weakRetestDown
+    retestSeen := true
+    retestHold := false
+    retestFail := false
+
+if retestFailureUp
+    retestSeen := true
+    retestFail := true
+    awaitingRetest := false
+
+if retestFailureDown
+    retestSeen := true
+    retestFail := true
+    awaitingRetest := false
+
+retestState = retestHold ? "RETEST HOLD" : retestFail ? "RETEST FAIL" : awaitingRetest ? "AWAITING RETEST" : acceptedDirection == 1 ? "ACCEPTED UP" : acceptedDirection == -1 ? "ACCEPTED DOWN" : "NONE"
+retestDecision = retestHold and acceptedDirection == 1 ? "LONG STRUCTURE CONFIRMED" : retestHold and acceptedDirection == -1 ? "SHORT STRUCTURE CONFIRMED" : retestFail ? "ACCEPTANCE FAILED" : awaitingRetest ? "WAIT FOR RETEST" : "WAIT"
+tradeStateV61 = retestHold and acceptedDirection == 1 and not possibleAbsorption ? "LONG — RETEST HOLD" : retestHold and acceptedDirection == -1 and not possibleAbsorption ? "SHORT — RETEST HOLD" : retestFail ? "WAIT — ACCEPTANCE FAILED" : awaitingRetest ? "WAIT — RETEST PENDING" : tradeState
+reasonV61 = retestHold ? "Broken edge held on retest" : retestFail ? "Price re-entered failed value discovery" : awaitingRetest ? "Acceptance occurred — wait for retest" : reason
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 11.4 PANEL
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var table panel = table.new(position.top_right, 2, 31, border_width=1)
+
+if barstate.islast and showPanel
+    table.cell(panel, 0, 0, "AuctionAI v0.6")
+    table.cell(panel, 1, 0, "ACTIVE")
+
+    table.cell(panel, 0, 1, "Context")
+    table.cell(panel, 1, 1, context)
+
+    table.cell(panel, 0, 2, "Location")
+    table.cell(panel, 1, 2, location)
+
+    table.cell(panel, 0, 3, "Attempt")
+    table.cell(panel, 1, 3, attempt)
+
+    table.cell(panel, 0, 4, "Auction")
+    table.cell(panel, 1, 4, auction)
+
+    table.cell(panel, 0, 5, "Decision")
+    table.cell(panel, 1, 5, decision)
+
+    table.cell(panel, 0, 6, "Hypothesis")
+    table.cell(panel, 1, 6, hypothesis)
+
+    table.cell(panel, 0, 7, "Context Score")
+    table.cell(panel, 1, 7, str.tostring(contextScore))
+
+    table.cell(panel, 0, 8, "Effort")
+    table.cell(panel, 1, 8, effort)
+
+    table.cell(panel, 0, 9, "Result")
+    table.cell(panel, 1, 9, result)
+
+    table.cell(panel, 0, 10, "Effort vs Result")
+    table.cell(panel, 1, 10, effortResult)
+
+    table.cell(panel, 0, 11, "Absorption")
+    table.cell(panel, 1, 11, absorptionReading)
+
+    table.cell(panel, 0, 12, "Participation")
+    table.cell(panel, 1, 12, participation)
+
+    table.cell(panel, 0, 13, "Delta Proxy")
+    table.cell(panel, 1, 13, str.tostring(math.round(deltaProxy)))
+
+    table.cell(panel, 0, 14, "Delta Direction")
+    table.cell(panel, 1, 14, deltaDirection)
+
+    table.cell(panel, 0, 15, "CVD Bias")
+    table.cell(panel, 1, 15, cvdBias)
+
+    table.cell(panel, 0, 16, "Trade State")
+    table.cell(panel, 1, 16, tradeState)
+
+    table.cell(panel, 0, 17, "Reason")
+    table.cell(panel, 1, 17, reasonV61)
+
+    table.cell(panel, 0, 18, "Acceptance")
+    table.cell(panel, 1, 18, acceptUp ? "UP" : acceptDown ? "DOWN" : "NONE")
+
+    table.cell(panel, 0, 19, "Rejection")
+    table.cell(panel, 1, 19, rejectionUp ? "UP" : rejectionDown ? "DOWN" : "NONE")
+
+    table.cell(panel, 0, 20, "Balance High")
+    table.cell(panel, 1, 20, str.tostring(rangeHigh, format.mintick))
+
+    table.cell(panel, 0, 21, "Balance Low")
+    table.cell(panel, 1, 21, str.tostring(rangeLow, format.mintick))
+
+    table.cell(panel, 0, 22, "CVD Proxy")
+    table.cell(panel, 1, 22, str.tostring(cvdProxy, format.mintick))
+
+    table.cell(panel, 0, 23, "Acceptance Bars")
+    table.cell(panel, 1, 23, str.tostring(math.max(upAcceptanceBars, downAcceptanceBars)))
+
+    table.cell(panel, 0, 24, "Acceptance Confirmed")
+    table.cell(panel, 1, 24, confirmedAcceptUp ? "UP" : confirmedAcceptDown ? "DOWN" : "NONE")
+
+    table.cell(panel, 0, 25, "Retest State")
+    table.cell(panel, 1, 23, retestState)
+    table.cell(panel, 0, 26, "Retest Decision")
+    table.cell(panel, 1, 26, retestDecision)
+    table.cell(panel, 0, 27, "Accepted Level")
+    table.cell(panel, 1, 27, na(acceptedLevel) ? "—" : str.tostring(acceptedLevel, format.mintick))
+    table.cell(panel, 0, 28, "Trade State v0.6.1")
+    table.cell(panel, 1, 28, tradeStateV61)
+    table.cell(panel, 0, 29, "Version")
+    table.cell(panel, 1, 29, "0.6.2")
+
+    table.cell(panel, 0, 30, "Retest Quality")
+    table.cell(panel, 1, 30,
+         retestQualityUp or retestQualityDown ? "CONFIRMED" :
+         weakRetestUp or weakRetestDown ? "WEAK" : "—")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 12. VISUALS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(showBalance ? rangeHigh : na, "Balance High")
+plot(showBalance ? rangeLow : na, "Balance Low")
+
+plotshape(showSignals and acceptUp, title="Acceptance Up", style=shape.triangleup,
+     location=location.belowbar, size=size.tiny, text="A↑")
+
+plotshape(showSignals and acceptDown, title="Acceptance Down", style=shape.triangledown,
+     location=location.abovebar, size=size.tiny, text="A↓")
+
+plotshape(showSignals and rejectionUp, title="Rejection Up", style=shape.xcross,
+     location=location.abovebar, size=size.tiny, text="R↑")
+
+plotshape(showSignals and rejectionDown, title="Rejection Down", style=shape.xcross,
+     location=location.belowbar, size=size.tiny, text="R↓")
+
+plotshape(showSignals and retestHold and acceptedDirection == 1, title="Retest Hold Up", style=shape.circle, location=location.belowbar, size=size.tiny, text="H↑")
+plotshape(showSignals and retestHold and acceptedDirection == -1, title="Retest Hold Down", style=shape.circle, location=location.abovebar, size=size.tiny, text="H↓")
+plotshape(showSignals and retestFail, title="Retest Fail", style=shape.xcross, location=location.abovebar, size=size.tiny, text="RF")
