@@ -3,6 +3,7 @@ indicator("AuctionAI v0.6.3 - Retest Validation & Market Evidence", overlay=true
 
 // v0.6.3 keeps the v0.6.x feature set and strengthens Acceptance -> Retest.
 // Acceptance Score is evidence quality only; it is NOT an entry trigger.
+// Retest breach is a WARNING first; failure requires confirmation.
 
 lookback = input.int(50, "Balance Lookback", minval=5)
 atrLength = input.int(14, "ATR Length", minval=1)
@@ -18,7 +19,6 @@ showPanel = input.bool(true, "Show Panel")
 showBalance = input.bool(true, "Show Balance")
 showSignals = input.bool(true, "Show Decision Signals")
 
-// 1. CONTEXT / BALANCE
 rangeHigh = ta.highest(high, lookback)[1]
 rangeLow = ta.lowest(low, lookback)[1]
 rangeSize = rangeHigh - rangeLow
@@ -27,7 +27,6 @@ location = positionValue > 0.75 ? "UPPER VALUE" : positionValue < 0.25 ? "LOWER 
 context = positionValue > 0.75 ? "UPPER" : positionValue < 0.25 ? "LOWER" : "BALANCE"
 inBalance = close <= rangeHigh and close >= rangeLow
 
-// 2. CANDLE / ATTEMPT
 atr = ta.atr(atrLength)
 body = math.abs(close - open)
 strongBody = body > atr * strongBodyATR
@@ -39,7 +38,6 @@ breakoutDown = close < rangeLow
 rejectUp = high > rangeHigh and close <= rangeHigh
 rejectDown = low < rangeLow and close >= rangeLow
 
-// 3. EFFORT / RESULT
 volumeAvg = ta.sma(volume, volumeLength)
 effortHigh = volume > volumeAvg
 resultMagnitude = math.abs(close - close[1])
@@ -48,7 +46,6 @@ effort = effortHigh ? "HIGH" : "LOW"
 result = resultHigh ? "HIGH" : "LOW"
 effortResult = effortHigh and resultHigh ? "HIGH EFFORT / HIGH RESULT" : effortHigh and not resultHigh ? "HIGH EFFORT / LOW RESULT" : not effortHigh and resultHigh ? "LOW EFFORT / HIGH RESULT" : "LOW EFFORT / LOW RESULT"
 
-// 4. DELTA / CVD PROXY — evidence, not decision by itself
 barRange = math.max(high - low, syminfo.mintick)
 buyPressure = ((close - low) / barRange) * 100.0
 sellPressure = ((high - close) / barRange) * 100.0
@@ -61,26 +58,22 @@ cvdBiasDown = deltaFast < deltaSlow
 cvdBias = cvdBiasUp ? "RISING" : cvdBiasDown ? "FALLING" : "FLAT"
 deltaDirection = deltaProxy > 0 ? "BUYER" : deltaProxy < 0 ? "SELLER" : "NEUTRAL"
 
-// 5. ABSORPTION
 possibleAbsorption = effortHigh and not resultHigh
 absorptionReading = possibleAbsorption and deltaProxy > 0 and close <= open ? "BUYING ABSORBED" : possibleAbsorption and deltaProxy < 0 and close >= open ? "SELLING ABSORBED" : possibleAbsorption ? "POSSIBLE ABSORPTION" : "NO ABSORPTION"
 
-// 6. INITIATIVE / RESPONSIVE
 initiativeUp = breakoutUp and strongBody and deltaProxy > 0
 initiativeDown = breakoutDown and strongBody and deltaProxy < 0
 responsiveUp = rejectUp and deltaProxy < 0
 responsiveDown = rejectDown and deltaProxy > 0
 participation = initiativeUp ? "INITIATIVE BUYER" : initiativeDown ? "INITIATIVE SELLER" : responsiveUp ? "RESPONSIVE SELLER" : responsiveDown ? "RESPONSIVE BUYER" : "NEUTRAL"
 
-// 7. LEGACY ACCEPTANCE / REJECTION — retained for v0.6.x compatibility
+// Legacy acceptance/rejection retained.
 acceptUp = breakoutUp and strongBody and resultHigh and deltaProxy > 0
 acceptDown = breakoutDown and strongBody and resultHigh and deltaProxy < 0
 rejectionUp = rejectUp and not acceptUp
 rejectionDown = rejectDown and not acceptDown
 
-// 8. ACCEPTANCE QUALITY SCORE
-// Each confirmed acceptance bar contributes evidence. The score is deliberately
-// separate from execution: it describes quality, not permission to enter.
+// Acceptance Score = evidence quality only, never an entry trigger.
 barAcceptanceUp = breakoutUp ? 2 : 0
 barAcceptanceDown = breakoutDown ? 2 : 0
 barBodyUp = breakoutUp and strongBody ? 1 : 0
@@ -110,11 +103,9 @@ confirmedAcceptUp = upAcceptanceBars >= acceptBarsRequired
 confirmedAcceptDown = downAcceptanceBars >= acceptBarsRequired
 newConfirmedAcceptUp = confirmedAcceptUp and not confirmedAcceptUp[1]
 newConfirmedAcceptDown = confirmedAcceptDown and not confirmedAcceptDown[1]
-
 acceptanceScore = confirmedAcceptUp ? acceptanceScoreUp : confirmedAcceptDown ? acceptanceScoreDown : math.max(acceptanceScoreUp, acceptanceScoreDown)
 acceptanceQuality = acceptanceScore >= 9 ? "VERY STRONG" : acceptanceScore >= 6 ? "STRONG" : acceptanceScore >= 3 ? "DEVELOPING" : "WEAK"
 
-// 9. AUCTION / DECISION / HYPOTHESIS
 auction = "BALANCE AUCTION"
 decision = "WAITING"
 hypothesis = "Searching"
@@ -145,7 +136,7 @@ else if attemptDown
 
 contextScore = confirmedAcceptUp ? 5 : confirmedAcceptDown ? -5 : responsiveDown ? 2 : responsiveUp ? -2 : initiativeUp ? 3 : initiativeDown ? -3 : 0
 
-// 10. ACCEPTANCE -> RETEST STATE MACHINE
+// Acceptance -> Retest state machine.
 var int acceptedDirection = 0
 var float acceptedLevel = na
 var bool awaitingRetest = false
@@ -153,6 +144,7 @@ var bool retestSeen = false
 var bool retestHold = false
 var bool retestFail = false
 var bool retestWeak = false
+var bool retestBreachWarning = false
 
 if newConfirmedAcceptUp
     acceptedDirection := 1
@@ -162,6 +154,7 @@ if newConfirmedAcceptUp
     retestHold := false
     retestFail := false
     retestWeak := false
+    retestBreachWarning := false
 else if newConfirmedAcceptDown
     acceptedDirection := -1
     acceptedLevel := rangeLow
@@ -170,14 +163,14 @@ else if newConfirmedAcceptDown
     retestHold := false
     retestFail := false
     retestWeak := false
+    retestBreachWarning := false
 
-// A touch is NOT automatically a validated retest.
+// Touch is not confirmation. Breach is not failure.
 retestTouchUp = awaitingRetest and acceptedDirection == 1 and low <= acceptedLevel and close >= acceptedLevel
 retestTouchDown = awaitingRetest and acceptedDirection == -1 and high >= acceptedLevel and close <= acceptedLevel
-retestFailureUp = awaitingRetest and acceptedDirection == 1 and close < acceptedLevel
-retestFailureDown = awaitingRetest and acceptedDirection == -1 and close > acceptedLevel
+retestBreachUp = awaitingRetest and acceptedDirection == 1 and close < acceptedLevel
+retestBreachDown = awaitingRetest and acceptedDirection == -1 and close > acceptedLevel
 
-// 11. RETEST EVIDENCE
 retestResultHigh = resultMagnitude > atr * retestResultATR
 retestDeltaAlignedUp = deltaProxy >= retestDeltaMin
 retestDeltaAlignedDown = deltaProxy <= -retestDeltaMin
@@ -193,53 +186,76 @@ retestConfirmedDown = retestTouchDown and retestReactionDown and retestResultHig
 retestEvidenceWeakUp = retestTouchUp and not retestConfirmedUp
 retestEvidenceWeakDown = retestTouchDown and not retestConfirmedDown
 
+// First breach = warning. The next bar must confirm that price remains beyond the level.
+confirmedFailureUp = retestBreachWarning[1] and acceptedDirection == 1 and close < acceptedLevel
+confirmedFailureDown = retestBreachWarning[1] and acceptedDirection == -1 and close > acceptedLevel
+reclaimAfterBreachUp = retestBreachWarning[1] and acceptedDirection == 1 and close >= acceptedLevel
+reclaimAfterBreachDown = retestBreachWarning[1] and acceptedDirection == -1 and close <= acceptedLevel
+
 if retestConfirmedUp
     retestSeen := true
     retestHold := true
     retestWeak := false
     retestFail := false
+    retestBreachWarning := false
     awaitingRetest := false
 else if retestEvidenceWeakUp
     retestSeen := true
     retestHold := false
     retestWeak := true
     retestFail := false
+    retestBreachWarning := false
     awaitingRetest := false
-else if retestFailureUp
+else if confirmedFailureUp
     retestSeen := true
     retestHold := false
     retestWeak := false
     retestFail := true
+    retestBreachWarning := false
     awaitingRetest := false
+else if reclaimAfterBreachUp
+    retestBreachWarning := false
+    awaitingRetest := true
+else if retestBreachUp
+    retestBreachWarning := true
+    awaitingRetest := true
 
 if retestConfirmedDown
     retestSeen := true
     retestHold := true
     retestWeak := false
     retestFail := false
+    retestBreachWarning := false
     awaitingRetest := false
 else if retestEvidenceWeakDown
     retestSeen := true
     retestHold := false
     retestWeak := true
     retestFail := false
+    retestBreachWarning := false
     awaitingRetest := false
-else if retestFailureDown
+else if confirmedFailureDown
     retestSeen := true
     retestHold := false
     retestWeak := false
     retestFail := true
+    retestBreachWarning := false
     awaitingRetest := false
+else if reclaimAfterBreachDown
+    retestBreachWarning := false
+    awaitingRetest := true
+else if retestBreachDown
+    retestBreachWarning := true
+    awaitingRetest := true
 
-retestQuality = retestHold ? "CONFIRMED" : retestWeak ? "WEAK" : retestFail ? "FAIL" : awaitingRetest ? "PENDING" : "—"
-retestState = retestHold ? "RETEST HOLD" : retestWeak ? "RETEST WEAK" : retestFail ? "RETEST FAIL" : awaitingRetest ? "AWAITING RETEST" : acceptedDirection == 1 ? "ACCEPTED UP" : acceptedDirection == -1 ? "ACCEPTED DOWN" : "NONE"
+retestQuality = retestHold ? "CONFIRMED" : retestWeak ? "WEAK" : retestFail ? "FAIL" : retestBreachWarning ? "WARNING" : awaitingRetest ? "PENDING" : "—"
+retestState = retestHold ? "RETEST HOLD" : retestWeak ? "RETEST WEAK" : retestFail ? "RETEST FAIL" : retestBreachWarning ? "BREACH WARNING" : awaitingRetest ? "AWAITING RETEST" : acceptedDirection == 1 ? "ACCEPTED UP" : acceptedDirection == -1 ? "ACCEPTED DOWN" : "NONE"
 
-// 12. DECISION LAYER — confirmed retest is structural evidence, NOT an entry trigger.
-tradeState = retestHold and acceptedDirection == 1 ? "CONFIRMED — WAIT FOR EXECUTION" : retestHold and acceptedDirection == -1 ? "CONFIRMED — WAIT FOR EXECUTION" : retestFail ? "WAIT — ACCEPTANCE FAILED" : retestWeak ? "WAIT — WEAK RETEST" : awaitingRetest ? "WAIT — RETEST PENDING" : confirmedAcceptUp ? "WAIT — ACCEPTANCE CONFIRMED" : confirmedAcceptDown ? "WAIT — ACCEPTANCE CONFIRMED" : "WAIT"
-reason = retestHold ? "Structure holds after retest" : retestFail ? "Level failed / returned to value" : retestWeak ? "Retest lacks sufficient evidence" : awaitingRetest ? "Acceptance occurred — wait for retest" : possibleAbsorption ? "High Effort / Low Result" : "Need More Information"
+// Confirmed Retest is structural evidence only. Execution is a separate future layer.
+tradeState = retestHold ? "CONFIRMED — WAIT FOR EXECUTION" : retestFail ? "WAIT — ACCEPTANCE FAILED" : retestWeak ? "WAIT — WEAK RETEST" : retestBreachWarning ? "WARNING — LEVEL BREACHED" : awaitingRetest ? "WAIT — RETEST PENDING" : confirmedAcceptUp or confirmedAcceptDown ? "WAIT — ACCEPTANCE CONFIRMED" : "WAIT"
+reason = retestHold ? "Structure holds after retest" : retestFail ? "Confirmed level failure" : retestWeak ? "Retest lacks sufficient evidence" : retestBreachWarning ? "Level breached — awaiting reclaim or confirmation" : awaitingRetest ? "Acceptance occurred — wait for retest" : possibleAbsorption ? "High Effort / Low Result" : "Need More Information"
 
-// 13. PANEL
-var table panel = table.new(position.top_right, 2, 34, border_width=1)
+var table panel = table.new(position.top_right, 2, 35, border_width=1)
 if barstate.islast and showPanel
     table.cell(panel, 0, 0, "AuctionAI v0.6.3")
     table.cell(panel, 1, 0, "ACTIVE")
@@ -284,9 +300,9 @@ if barstate.islast and showPanel
     table.cell(panel, 0, 20, "Retest Quality")
     table.cell(panel, 1, 20, retestQuality)
     table.cell(panel, 0, 21, "Retest Delta")
-    table.cell(panel, 1, 21, retestDeltaAlignedUp or retestDeltaAlignedDown ? "ALIGNED" : "NOT ALIGNED")
+    table.cell(panel, 1, 21, (retestDeltaAlignedUp and acceptedDirection == 1) or (retestDeltaAlignedDown and acceptedDirection == -1) ? "ALIGNED" : "NOT ALIGNED")
     table.cell(panel, 0, 22, "Retest CVD")
-    table.cell(panel, 1, 22, retestCvdAlignedUp and acceptedDirection == 1 or retestCvdAlignedDown and acceptedDirection == -1 ? "ALIGNED" : "NOT ALIGNED")
+    table.cell(panel, 1, 22, (retestCvdAlignedUp and acceptedDirection == 1) or (retestCvdAlignedDown and acceptedDirection == -1) ? "ALIGNED" : "NOT ALIGNED")
     table.cell(panel, 0, 23, "Retest Result")
     table.cell(panel, 1, 23, retestResultHigh ? "HIGH" : "LOW")
     table.cell(panel, 0, 24, "Retest E/R")
@@ -307,10 +323,11 @@ if barstate.islast and showPanel
     table.cell(panel, 1, 31, "EVIDENCE ONLY")
     table.cell(panel, 0, 32, "Execution")
     table.cell(panel, 1, 32, "SEPARATE LAYER")
-    table.cell(panel, 0, 33, "Status")
-    table.cell(panel, 1, 33, "REGRESSION-FOCUSED")
+    table.cell(panel, 0, 33, "Retest Breach")
+    table.cell(panel, 1, 33, retestBreachWarning ? "WARNING" : "NONE")
+    table.cell(panel, 0, 34, "Status")
+    table.cell(panel, 1, 34, "REGRESSION-FOCUSED")
 
-// 14. VISUALS
 plot(showBalance ? rangeHigh : na, "Balance High")
 plot(showBalance ? rangeLow : na, "Balance Low")
 plotshape(showSignals and newConfirmedAcceptUp, title="Acceptance Up", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="A↑")
@@ -320,4 +337,5 @@ plotshape(showSignals and rejectionDown, title="Rejection Down", style=shape.xcr
 plotshape(showSignals and retestHold and acceptedDirection == 1, title="Retest Confirmed Up", style=shape.circle, location=location.belowbar, size=size.tiny, text="C↑")
 plotshape(showSignals and retestHold and acceptedDirection == -1, title="Retest Confirmed Down", style=shape.circle, location=location.abovebar, size=size.tiny, text="C↓")
 plotshape(showSignals and retestWeak, title="Retest Weak", style=shape.diamond, location=location.abovebar, size=size.tiny, text="W")
-plotshape(showSignals and retestFail, title="Retest Fail", style=shape.xcross, location=location.abovebar, size=size.tiny, text="F")
+plotshape(showSignals and retestBreachWarning, title="Retest Breach Warning", style=shape.diamond, location=location.abovebar, size=size.tiny, text="!")
+plotshape(showSignals and retestFail, title="Retest Confirmed Fail", style=shape.xcross, location=location.abovebar, size=size.tiny, text="F")
