@@ -1,0 +1,323 @@
+//@version=6
+indicator("AuctionAI v0.6.3 - Retest Validation & Market Evidence", overlay=true)
+
+// v0.6.3 keeps the v0.6.x feature set and strengthens Acceptance -> Retest.
+// Acceptance Score is evidence quality only; it is NOT an entry trigger.
+
+lookback = input.int(50, "Balance Lookback", minval=5)
+atrLength = input.int(14, "ATR Length", minval=1)
+volumeLength = input.int(20, "Volume Average Length", minval=2)
+deltaFastLen = input.int(20, "Delta Fast Length", minval=2)
+deltaSlowLen = input.int(50, "Delta Slow Length", minval=3)
+strongBodyATR = input.float(0.7, "Strong Body / ATR", minval=0.1, step=0.1)
+resultATR = input.float(0.5, "High Result / ATR", minval=0.1, step=0.1)
+acceptBarsRequired = input.int(2, "Acceptance Confirmation Bars", minval=1, maxval=5)
+retestDeltaMin = input.float(5.0, "Retest Delta Alignment Threshold", minval=0.0, step=1.0)
+retestResultATR = input.float(0.25, "Retest Result / ATR", minval=0.05, step=0.05)
+showPanel = input.bool(true, "Show Panel")
+showBalance = input.bool(true, "Show Balance")
+showSignals = input.bool(true, "Show Decision Signals")
+
+// 1. CONTEXT / BALANCE
+rangeHigh = ta.highest(high, lookback)[1]
+rangeLow = ta.lowest(low, lookback)[1]
+rangeSize = rangeHigh - rangeLow
+positionValue = rangeSize > 0 ? (close - rangeLow) / rangeSize : 0.5
+location = positionValue > 0.75 ? "UPPER VALUE" : positionValue < 0.25 ? "LOWER VALUE" : "MID VALUE"
+context = positionValue > 0.75 ? "UPPER" : positionValue < 0.25 ? "LOWER" : "BALANCE"
+inBalance = close <= rangeHigh and close >= rangeLow
+
+// 2. CANDLE / ATTEMPT
+atr = ta.atr(atrLength)
+body = math.abs(close - open)
+strongBody = body > atr * strongBodyATR
+attemptUp = high > rangeHigh
+attemptDown = low < rangeLow
+attempt = attemptUp and attemptDown ? "TWO-SIDED ATTEMPT" : attemptUp ? "BREAKOUT UP" : attemptDown ? "BREAKOUT DOWN" : "NONE"
+breakoutUp = close > rangeHigh
+breakoutDown = close < rangeLow
+rejectUp = high > rangeHigh and close <= rangeHigh
+rejectDown = low < rangeLow and close >= rangeLow
+
+// 3. EFFORT / RESULT
+volumeAvg = ta.sma(volume, volumeLength)
+effortHigh = volume > volumeAvg
+resultMagnitude = math.abs(close - close[1])
+resultHigh = resultMagnitude > atr * resultATR
+effort = effortHigh ? "HIGH" : "LOW"
+result = resultHigh ? "HIGH" : "LOW"
+effortResult = effortHigh and resultHigh ? "HIGH EFFORT / HIGH RESULT" : effortHigh and not resultHigh ? "HIGH EFFORT / LOW RESULT" : not effortHigh and resultHigh ? "LOW EFFORT / HIGH RESULT" : "LOW EFFORT / LOW RESULT"
+
+// 4. DELTA / CVD PROXY — evidence, not decision by itself
+barRange = math.max(high - low, syminfo.mintick)
+buyPressure = ((close - low) / barRange) * 100.0
+sellPressure = ((high - close) / barRange) * 100.0
+deltaProxy = buyPressure - sellPressure
+cvdProxy = ta.cum(deltaProxy)
+deltaFast = ta.ema(deltaProxy, deltaFastLen)
+deltaSlow = ta.ema(deltaProxy, deltaSlowLen)
+cvdBiasUp = deltaFast > deltaSlow
+cvdBiasDown = deltaFast < deltaSlow
+cvdBias = cvdBiasUp ? "RISING" : cvdBiasDown ? "FALLING" : "FLAT"
+deltaDirection = deltaProxy > 0 ? "BUYER" : deltaProxy < 0 ? "SELLER" : "NEUTRAL"
+
+// 5. ABSORPTION
+possibleAbsorption = effortHigh and not resultHigh
+absorptionReading = possibleAbsorption and deltaProxy > 0 and close <= open ? "BUYING ABSORBED" : possibleAbsorption and deltaProxy < 0 and close >= open ? "SELLING ABSORBED" : possibleAbsorption ? "POSSIBLE ABSORPTION" : "NO ABSORPTION"
+
+// 6. INITIATIVE / RESPONSIVE
+initiativeUp = breakoutUp and strongBody and deltaProxy > 0
+initiativeDown = breakoutDown and strongBody and deltaProxy < 0
+responsiveUp = rejectUp and deltaProxy < 0
+responsiveDown = rejectDown and deltaProxy > 0
+participation = initiativeUp ? "INITIATIVE BUYER" : initiativeDown ? "INITIATIVE SELLER" : responsiveUp ? "RESPONSIVE SELLER" : responsiveDown ? "RESPONSIVE BUYER" : "NEUTRAL"
+
+// 7. LEGACY ACCEPTANCE / REJECTION — retained for v0.6.x compatibility
+acceptUp = breakoutUp and strongBody and resultHigh and deltaProxy > 0
+acceptDown = breakoutDown and strongBody and resultHigh and deltaProxy < 0
+rejectionUp = rejectUp and not acceptUp
+rejectionDown = rejectDown and not acceptDown
+
+// 8. ACCEPTANCE QUALITY SCORE
+// Each confirmed acceptance bar contributes evidence. The score is deliberately
+// separate from execution: it describes quality, not permission to enter.
+barAcceptanceUp = breakoutUp ? 2 : 0
+barAcceptanceDown = breakoutDown ? 2 : 0
+barBodyUp = breakoutUp and strongBody ? 1 : 0
+barBodyDown = breakoutDown and strongBody ? 1 : 0
+barResultUp = breakoutUp and resultHigh ? 1 : 0
+barResultDown = breakoutDown and resultHigh ? 1 : 0
+barDeltaUp = breakoutUp and deltaProxy > 0 ? 2 : 0
+barDeltaDown = breakoutDown and deltaProxy < 0 ? 2 : 0
+barCvdUp = breakoutUp and cvdBiasUp ? 2 : 0
+barCvdDown = breakoutDown and cvdBiasDown ? 2 : 0
+barEffortUp = breakoutUp and effortHigh ? 1 : 0
+barEffortDown = breakoutDown and effortHigh ? 1 : 0
+barAbsorbPenaltyUp = breakoutUp and possibleAbsorption ? 3 : 0
+barAbsorbPenaltyDown = breakoutDown and possibleAbsorption ? 3 : 0
+barAcceptanceScoreUp = math.max(0, barAcceptanceUp + barBodyUp + barResultUp + barDeltaUp + barCvdUp + barEffortUp - barAbsorbPenaltyUp)
+barAcceptanceScoreDown = math.max(0, barAcceptanceDown + barBodyDown + barResultDown + barDeltaDown + barCvdDown + barEffortDown - barAbsorbPenaltyDown)
+
+var int upAcceptanceBars = 0
+var int downAcceptanceBars = 0
+var float acceptanceScoreUp = 0.0
+var float acceptanceScoreDown = 0.0
+upAcceptanceBars := breakoutUp ? upAcceptanceBars + 1 : 0
+downAcceptanceBars := breakoutDown ? downAcceptanceBars + 1 : 0
+acceptanceScoreUp := breakoutUp ? acceptanceScoreUp + barAcceptanceScoreUp : 0
+acceptanceScoreDown := breakoutDown ? acceptanceScoreDown + barAcceptanceScoreDown : 0
+confirmedAcceptUp = upAcceptanceBars >= acceptBarsRequired
+confirmedAcceptDown = downAcceptanceBars >= acceptBarsRequired
+newConfirmedAcceptUp = confirmedAcceptUp and not confirmedAcceptUp[1]
+newConfirmedAcceptDown = confirmedAcceptDown and not confirmedAcceptDown[1]
+
+acceptanceScore = confirmedAcceptUp ? acceptanceScoreUp : confirmedAcceptDown ? acceptanceScoreDown : math.max(acceptanceScoreUp, acceptanceScoreDown)
+acceptanceQuality = acceptanceScore >= 9 ? "VERY STRONG" : acceptanceScore >= 6 ? "STRONG" : acceptanceScore >= 3 ? "DEVELOPING" : "WEAK"
+
+// 9. AUCTION / DECISION / HYPOTHESIS
+auction = "BALANCE AUCTION"
+decision = "WAITING"
+hypothesis = "Searching"
+if confirmedAcceptUp
+    auction := "NEW VALUE HIGHER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Buyer / Acceptance"
+else if confirmedAcceptDown
+    auction := "NEW VALUE LOWER"
+    decision := "ACCEPTED"
+    hypothesis := "Initiative Seller / Acceptance"
+else if rejectionUp
+    auction := "FAILED AUCTION UP"
+    decision := "REJECTION"
+    hypothesis := "Responsive Seller / Possible Retest"
+else if rejectionDown
+    auction := "FAILED AUCTION DOWN"
+    decision := "REJECTION"
+    hypothesis := "Responsive Buyer / Possible Retest"
+else if attemptUp
+    auction := "VALUE TEST HIGH"
+    decision := "WAITING"
+    hypothesis := "Wait for Acceptance or Rejection"
+else if attemptDown
+    auction := "VALUE TEST LOW"
+    decision := "WAITING"
+    hypothesis := "Wait for Acceptance or Rejection"
+
+contextScore = confirmedAcceptUp ? 5 : confirmedAcceptDown ? -5 : responsiveDown ? 2 : responsiveUp ? -2 : initiativeUp ? 3 : initiativeDown ? -3 : 0
+
+// 10. ACCEPTANCE -> RETEST STATE MACHINE
+var int acceptedDirection = 0
+var float acceptedLevel = na
+var bool awaitingRetest = false
+var bool retestSeen = false
+var bool retestHold = false
+var bool retestFail = false
+var bool retestWeak = false
+
+if newConfirmedAcceptUp
+    acceptedDirection := 1
+    acceptedLevel := rangeHigh
+    awaitingRetest := true
+    retestSeen := false
+    retestHold := false
+    retestFail := false
+    retestWeak := false
+else if newConfirmedAcceptDown
+    acceptedDirection := -1
+    acceptedLevel := rangeLow
+    awaitingRetest := true
+    retestSeen := false
+    retestHold := false
+    retestFail := false
+    retestWeak := false
+
+// A touch is NOT automatically a validated retest.
+retestTouchUp = awaitingRetest and acceptedDirection == 1 and low <= acceptedLevel and close >= acceptedLevel
+retestTouchDown = awaitingRetest and acceptedDirection == -1 and high >= acceptedLevel and close <= acceptedLevel
+retestFailureUp = awaitingRetest and acceptedDirection == 1 and close < acceptedLevel
+retestFailureDown = awaitingRetest and acceptedDirection == -1 and close > acceptedLevel
+
+// 11. RETEST EVIDENCE
+retestResultHigh = resultMagnitude > atr * retestResultATR
+retestDeltaAlignedUp = deltaProxy >= retestDeltaMin
+retestDeltaAlignedDown = deltaProxy <= -retestDeltaMin
+retestCvdAlignedUp = cvdBiasUp
+retestCvdAlignedDown = cvdBiasDown
+retestReactionUp = close > open and close > close[1] and resultMagnitude > 0
+retestReactionDown = close < open and close < close[1] and resultMagnitude > 0
+retestStrongEffort = effortHigh
+retestHighEffortLowResult = retestStrongEffort and not retestResultHigh
+
+retestConfirmedUp = retestTouchUp and retestReactionUp and retestResultHigh and retestDeltaAlignedUp and retestCvdAlignedUp and not retestHighEffortLowResult and not possibleAbsorption
+retestConfirmedDown = retestTouchDown and retestReactionDown and retestResultHigh and retestDeltaAlignedDown and retestCvdAlignedDown and not retestHighEffortLowResult and not possibleAbsorption
+retestEvidenceWeakUp = retestTouchUp and not retestConfirmedUp
+retestEvidenceWeakDown = retestTouchDown and not retestConfirmedDown
+
+if retestConfirmedUp
+    retestSeen := true
+    retestHold := true
+    retestWeak := false
+    retestFail := false
+    awaitingRetest := false
+else if retestEvidenceWeakUp
+    retestSeen := true
+    retestHold := false
+    retestWeak := true
+    retestFail := false
+    awaitingRetest := false
+else if retestFailureUp
+    retestSeen := true
+    retestHold := false
+    retestWeak := false
+    retestFail := true
+    awaitingRetest := false
+
+if retestConfirmedDown
+    retestSeen := true
+    retestHold := true
+    retestWeak := false
+    retestFail := false
+    awaitingRetest := false
+else if retestEvidenceWeakDown
+    retestSeen := true
+    retestHold := false
+    retestWeak := true
+    retestFail := false
+    awaitingRetest := false
+else if retestFailureDown
+    retestSeen := true
+    retestHold := false
+    retestWeak := false
+    retestFail := true
+    awaitingRetest := false
+
+retestQuality = retestHold ? "CONFIRMED" : retestWeak ? "WEAK" : retestFail ? "FAIL" : awaitingRetest ? "PENDING" : "—"
+retestState = retestHold ? "RETEST HOLD" : retestWeak ? "RETEST WEAK" : retestFail ? "RETEST FAIL" : awaitingRetest ? "AWAITING RETEST" : acceptedDirection == 1 ? "ACCEPTED UP" : acceptedDirection == -1 ? "ACCEPTED DOWN" : "NONE"
+
+// 12. DECISION LAYER — confirmed retest is structural evidence, NOT an entry trigger.
+tradeState = retestHold and acceptedDirection == 1 ? "CONFIRMED — WAIT FOR EXECUTION" : retestHold and acceptedDirection == -1 ? "CONFIRMED — WAIT FOR EXECUTION" : retestFail ? "WAIT — ACCEPTANCE FAILED" : retestWeak ? "WAIT — WEAK RETEST" : awaitingRetest ? "WAIT — RETEST PENDING" : confirmedAcceptUp ? "WAIT — ACCEPTANCE CONFIRMED" : confirmedAcceptDown ? "WAIT — ACCEPTANCE CONFIRMED" : "WAIT"
+reason = retestHold ? "Structure holds after retest" : retestFail ? "Level failed / returned to value" : retestWeak ? "Retest lacks sufficient evidence" : awaitingRetest ? "Acceptance occurred — wait for retest" : possibleAbsorption ? "High Effort / Low Result" : "Need More Information"
+
+// 13. PANEL
+var table panel = table.new(position.top_right, 2, 34, border_width=1)
+if barstate.islast and showPanel
+    table.cell(panel, 0, 0, "AuctionAI v0.6.3")
+    table.cell(panel, 1, 0, "ACTIVE")
+    table.cell(panel, 0, 1, "Context")
+    table.cell(panel, 1, 1, context)
+    table.cell(panel, 0, 2, "Location")
+    table.cell(panel, 1, 2, location)
+    table.cell(panel, 0, 3, "Attempt")
+    table.cell(panel, 1, 3, attempt)
+    table.cell(panel, 0, 4, "Auction")
+    table.cell(panel, 1, 4, auction)
+    table.cell(panel, 0, 5, "Decision")
+    table.cell(panel, 1, 5, decision)
+    table.cell(panel, 0, 6, "Hypothesis")
+    table.cell(panel, 1, 6, hypothesis)
+    table.cell(panel, 0, 7, "Context Score")
+    table.cell(panel, 1, 7, str.tostring(contextScore))
+    table.cell(panel, 0, 8, "Effort")
+    table.cell(panel, 1, 8, effort)
+    table.cell(panel, 0, 9, "Result")
+    table.cell(panel, 1, 9, result)
+    table.cell(panel, 0, 10, "Effort vs Result")
+    table.cell(panel, 1, 10, effortResult)
+    table.cell(panel, 0, 11, "Absorption")
+    table.cell(panel, 1, 11, absorptionReading)
+    table.cell(panel, 0, 12, "Participation")
+    table.cell(panel, 1, 12, participation)
+    table.cell(panel, 0, 13, "Delta Proxy")
+    table.cell(panel, 1, 13, str.tostring(math.round(deltaProxy)))
+    table.cell(panel, 0, 14, "Delta Direction")
+    table.cell(panel, 1, 14, deltaDirection)
+    table.cell(panel, 0, 15, "CVD Bias")
+    table.cell(panel, 1, 15, cvdBias)
+    table.cell(panel, 0, 16, "Acceptance Bars")
+    table.cell(panel, 1, 16, str.tostring(math.max(upAcceptanceBars, downAcceptanceBars)))
+    table.cell(panel, 0, 17, "Acceptance Score")
+    table.cell(panel, 1, 17, str.tostring(acceptanceScore, "#.0") + " / " + acceptanceQuality)
+    table.cell(panel, 0, 18, "Acceptance Confirmed")
+    table.cell(panel, 1, 18, confirmedAcceptUp ? "UP" : confirmedAcceptDown ? "DOWN" : "NONE")
+    table.cell(panel, 0, 19, "Retest State")
+    table.cell(panel, 1, 19, retestState)
+    table.cell(panel, 0, 20, "Retest Quality")
+    table.cell(panel, 1, 20, retestQuality)
+    table.cell(panel, 0, 21, "Retest Delta")
+    table.cell(panel, 1, 21, retestDeltaAlignedUp or retestDeltaAlignedDown ? "ALIGNED" : "NOT ALIGNED")
+    table.cell(panel, 0, 22, "Retest CVD")
+    table.cell(panel, 1, 22, retestCvdAlignedUp and acceptedDirection == 1 or retestCvdAlignedDown and acceptedDirection == -1 ? "ALIGNED" : "NOT ALIGNED")
+    table.cell(panel, 0, 23, "Retest Result")
+    table.cell(panel, 1, 23, retestResultHigh ? "HIGH" : "LOW")
+    table.cell(panel, 0, 24, "Retest E/R")
+    table.cell(panel, 1, 24, retestHighEffortLowResult ? "WARNING" : "OK")
+    table.cell(panel, 0, 25, "Accepted Level")
+    table.cell(panel, 1, 25, na(acceptedLevel) ? "—" : str.tostring(acceptedLevel, format.mintick))
+    table.cell(panel, 0, 26, "Trade State")
+    table.cell(panel, 1, 26, tradeState)
+    table.cell(panel, 0, 27, "Reason")
+    table.cell(panel, 1, 27, reason)
+    table.cell(panel, 0, 28, "CVD Proxy")
+    table.cell(panel, 1, 28, str.tostring(cvdProxy, format.mintick))
+    table.cell(panel, 0, 29, "Initiative / Responsive")
+    table.cell(panel, 1, 29, participation)
+    table.cell(panel, 0, 30, "Version")
+    table.cell(panel, 1, 30, "0.6.3")
+    table.cell(panel, 0, 31, "Score Role")
+    table.cell(panel, 1, 31, "EVIDENCE ONLY")
+    table.cell(panel, 0, 32, "Execution")
+    table.cell(panel, 1, 32, "SEPARATE LAYER")
+    table.cell(panel, 0, 33, "Status")
+    table.cell(panel, 1, 33, "REGRESSION-FOCUSED")
+
+// 14. VISUALS
+plot(showBalance ? rangeHigh : na, "Balance High")
+plot(showBalance ? rangeLow : na, "Balance Low")
+plotshape(showSignals and newConfirmedAcceptUp, title="Acceptance Up", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="A↑")
+plotshape(showSignals and newConfirmedAcceptDown, title="Acceptance Down", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="A↓")
+plotshape(showSignals and rejectionUp, title="Rejection Up", style=shape.xcross, location=location.abovebar, size=size.tiny, text="R↑")
+plotshape(showSignals and rejectionDown, title="Rejection Down", style=shape.xcross, location=location.belowbar, size=size.tiny, text="R↓")
+plotshape(showSignals and retestHold and acceptedDirection == 1, title="Retest Confirmed Up", style=shape.circle, location=location.belowbar, size=size.tiny, text="C↑")
+plotshape(showSignals and retestHold and acceptedDirection == -1, title="Retest Confirmed Down", style=shape.circle, location=location.abovebar, size=size.tiny, text="C↓")
+plotshape(showSignals and retestWeak, title="Retest Weak", style=shape.diamond, location=location.abovebar, size=size.tiny, text="W")
+plotshape(showSignals and retestFail, title="Retest Fail", style=shape.xcross, location=location.abovebar, size=size.tiny, text="F")
