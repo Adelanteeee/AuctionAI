@@ -1,12 +1,13 @@
 //@version=6
 indicator("AuctionAI v0.6.9 - Decision Audit & Setup Lifecycle Validation", overlay=true)
 
-// v0.6.9
-// Decision Audit + Setup Lifecycle Validation.
-// No execution, prediction, ML, optimization, or profit model is added.
+// v0.6.9 — Decision Audit & Setup Lifecycle Validation
+// Execution, prediction, ML, optimization and auto-trading are intentionally excluded.
 // Acceptance Score = Acceptance Evidence Quality Only.
 // Retest Score = Retest Evidence Quality Only.
 // Confluence = Evidence alignment. Confidence = overall setup quality.
+// IMPORTANT: setup archive/reset is intentionally inline. Pine functions cannot
+// reassign global value variables, so archiveActiveSetup()/startNewSetup() are not used.
 
 lookback = input.int(50, "Balance Lookback", minval=5)
 atrLength = input.int(14, "ATR Length", minval=1)
@@ -107,7 +108,6 @@ var float acceptanceEffortSnap = na
 var bool acceptanceAbsorptionSnap = false
 var float acceptanceScoreSnap = na
 var int acceptanceSnapshotBar = na
-
 var float retestDeltaSnap = na
 var int retestCvdSnap = 0
 var float retestResultSnap = na
@@ -134,12 +134,15 @@ var bool archivedAcceptanceAbsorption = false
 var bool archivedRetestAbsorption = false
 var int archivedBreachCount = 0
 
-// ---------- SETUP RESET / ARCHIVE ----------
-archiveActiveSetup(_finalState) =>
+// ---------- NEW SETUP / ARCHIVE ----------
+// Pine functions cannot reassign global value variables. The two lifecycle operations
+// are therefore performed directly in global-scope conditional blocks.
+if newAcceptUp or newAcceptDown
+    // Archive previous active setup before replacing it.
     if setupActive
         archivedSetupId := setupId
         archivedDirection := direction
-        archivedFinalState := _finalState
+        archivedFinalState := state
         archivedAcceptanceBar := acceptanceSnapshotBar
         archivedRetestBar := retestSnapshotBar
         archivedAcceptanceLevel := acceptedLevel
@@ -153,16 +156,17 @@ archiveActiveSetup(_finalState) =>
         archivedRetestAbsorption := retestAbsorptionSnap
         archivedBreachCount := breachCount
 
-startNewSetup(_dir, _level) =>
+    // Start the new setup.
     setupId += 1
-    direction := _dir
-    acceptedLevel := _level
+    direction := newAcceptUp ? 1 : -1
+    acceptedLevel := newAcceptUp ? rangeHigh : rangeLow
     acceptanceIndex := bar_index
     stateIndex := bar_index
     state := WAIT_RETEST
     setupActive := true
     breachCount := 0
     reclaimCount := 0
+
     acceptanceDeltaSnap := deltaProxy
     acceptanceCvdSnap := cvdUp ? 1 : cvdDown ? -1 : 0
     acceptanceResultSnap := resultMagnitude / math.max(atr, syminfo.mintick)
@@ -170,6 +174,7 @@ startNewSetup(_dir, _level) =>
     acceptanceAbsorptionSnap := possibleAbsorption
     acceptanceScoreSnap := math.min(10.0, acceptanceScore)
     acceptanceSnapshotBar := bar_index
+
     retestDeltaSnap := na
     retestCvdSnap := 0
     retestResultSnap := na
@@ -178,12 +183,6 @@ startNewSetup(_dir, _level) =>
     retestScoreSnap := na
     retestSnapshotBar := na
     retestStateAtSnapshot := NONE
-
-// A new confirmed acceptance always starts a new setup and archives the previous one.
-if newAcceptUp or newAcceptDown
-    if setupActive
-        archiveActiveSetup(state)
-    startNewSetup(newAcceptUp ? 1 : -1, newAcceptUp ? rangeHigh : rangeLow)
 
 hasSetup = setupActive and not na(acceptedLevel) and not na(acceptanceIndex)
 barsSinceAcceptance = hasSetup ? bar_index - acceptanceIndex : 0
@@ -213,9 +212,24 @@ if retestTouched and na(retestSnapshotBar)
     retestSnapshotBar := bar_index
     retestStateAtSnapshot := retestHoldUp or retestHoldDown ? RETEST_HOLD : RETEST_WEAK
 
-// Expiry closes the setup and prevents old evidence from remaining active.
+// ---------- EXPIRY ----------
 if hasSetup and waitLike and barsSinceAcceptance >= retestWindowBars and not retestTouched
-    archiveActiveSetup(RETEST_EXPIRED)
+    archivedSetupId := setupId
+    archivedDirection := direction
+    archivedFinalState := RETEST_EXPIRED
+    archivedAcceptanceBar := acceptanceSnapshotBar
+    archivedRetestBar := retestSnapshotBar
+    archivedAcceptanceLevel := acceptedLevel
+    archivedAcceptanceScore := acceptanceScoreSnap
+    archivedRetestScore := retestScoreSnap
+    archivedAcceptanceCvd := acceptanceCvdSnap
+    archivedRetestCvd := retestCvdSnap
+    archivedAcceptanceResult := acceptanceResultSnap
+    archivedRetestResult := retestResultSnap
+    archivedAcceptanceAbsorption := acceptanceAbsorptionSnap
+    archivedRetestAbsorption := retestAbsorptionSnap
+    archivedBreachCount := breachCount
+
     setupActive := false
     state := RETEST_EXPIRED
     stateIndex := bar_index
@@ -253,14 +267,27 @@ if hasSetup and state == BREACH_WARNING and reclaimCandidate
         reclaimCount := 0
 
 if hasSetup and state == BREACH_WARNING and breachCount >= failureBarsRequired
-    archiveActiveSetup(RETEST_FAIL)
+    archivedSetupId := setupId
+    archivedDirection := direction
+    archivedFinalState := RETEST_FAIL
+    archivedAcceptanceBar := acceptanceSnapshotBar
+    archivedRetestBar := retestSnapshotBar
+    archivedAcceptanceLevel := acceptedLevel
+    archivedAcceptanceScore := acceptanceScoreSnap
+    archivedRetestScore := retestScoreSnap
+    archivedAcceptanceCvd := acceptanceCvdSnap
+    archivedRetestCvd := retestCvdSnap
+    archivedAcceptanceResult := acceptanceResultSnap
+    archivedRetestResult := retestResultSnap
+    archivedAcceptanceAbsorption := acceptanceAbsorptionSnap
+    archivedRetestAbsorption := retestAbsorptionSnap
+    archivedBreachCount := breachCount
+
     setupActive := false
     state := RETEST_FAIL
     stateIndex := bar_index
     breachCount := 0
     reclaimCount := 0
-
-// Reclaim is a confirmed lifecycle event but does not create an execution signal.
 
 // ---------- SNAPSHOT COMPARISON ----------
 acceptDeltaDirection = na(acceptanceDeltaSnap) ? "—" : acceptanceDeltaSnap > 0 ? "BUY" : acceptanceDeltaSnap < 0 ? "SELL" : "NEUTRAL"
@@ -279,7 +306,6 @@ resultConflict = retestScoreAvailable and not na(acceptanceResultSnap) and not n
 conflictCount = (flowConflict ? 1 : 0) + (deltaComparisonConflict ? 1 : 0) + (cvdComparisonConflict ? 1 : 0) + (absorptionConflict ? 1 : 0) + (resultConflict ? 1 : 0)
 conflictText = conflictCount == 0 ? "NONE" : (flowConflict ? "FLOW: Delta/CVD; " : "") + (deltaComparisonConflict ? "Delta Decay; " : "") + (cvdComparisonConflict ? "CVD Decay; " : "") + (absorptionConflict ? "Absorption; " : "") + (resultConflict ? "Result Decay; " : "")
 
-// Per-evidence comparison for diagnostics.
 deltaAlignment = not retestScoreAvailable ? "PENDING" : deltaComparisonConflict ? "WEAKENING" : "ALIGNED"
 cvdAlignment = not retestScoreAvailable ? "PENDING" : cvdComparisonConflict ? "WEAKENING" : "ALIGNED"
 resultAlignment = not retestScoreAvailable ? "PENDING" : resultConflict ? "WEAKENING" : "STABLE"
@@ -295,18 +321,14 @@ noAbsorption = activeStructure and not possibleAbsorption
 retestAligned = state == RETEST_HOLD and retestScoreAvailable and conflictCount == 0
 confluenceScore = (priceAligned ? 2 : 0) + (deltaAligned ? 2 : 0) + (cvdAligned ? 2 : 0) + (resultAligned ? 1 : 0) + (noAbsorption ? 1 : 0) + (retestAligned ? 2 : 0)
 confluenceScoreClamped = math.max(0, math.min(10, confluenceScore))
-
 acceptQualityStrong = not na(acceptanceScoreSnap) and acceptanceScoreSnap >= 6
 retestQualityStrong = retestScoreAvailable and retestScoreSnap >= 6
 confidence = not activeStructure ? "LOW" : state == RETEST_HOLD and acceptQualityStrong and retestQualityStrong and evidenceTrend != "WEAKENING" and conflictCount == 0 ? "HIGH" : acceptQualityStrong and retestScoreAvailable and confluenceScoreClamped >= 4 and conflictCount <= 1 ? "MEDIUM" : "LOW"
 
 // ---------- DECISION AUDIT ----------
 stateText = state == WAIT_RETEST ? "WAIT RETEST" : state == RETEST_WEAK ? "RETEST WEAK" : state == RETEST_HOLD ? "RETEST HOLD" : state == BREACH_WARNING ? "BREACH WARNING" : state == RECLAIM_CONFIRMED ? "RECLAIM CONFIRMED" : state == RETEST_FAIL ? "RETEST FAIL" : state == RETEST_EXPIRED ? "RETEST EXPIRED" : "NONE"
-
 decision = state == RETEST_HOLD and direction == 1 and conflictCount == 0 ? "LONG BIAS" : state == RETEST_HOLD and direction == -1 and conflictCount == 0 ? "SHORT BIAS" : state == RETEST_HOLD ? "HOLD / CONFLICT" : state == RETEST_WEAK ? "WEAK" : state == BREACH_WARNING ? "BREACH" : state == RECLAIM_CONFIRMED ? "RECLAIM" : state == RETEST_FAIL ? "FAIL" : state == RETEST_EXPIRED ? "EXPIRED" : "WAIT"
-
 reason = state == RETEST_HOLD and conflictCount == 0 ? "Acceptance preserved; Retest held; no major conflict" : state == RETEST_HOLD ? "Retest held but evidence conflicts remain" : state == RETEST_WEAK ? "Retest touched level but evidence weakened / is insufficient" : state == BREACH_WARNING ? "Accepted level violated; reclaim or failure pending" : state == RECLAIM_CONFIRMED ? "Price reclaimed accepted level with required confirmation" : state == RETEST_FAIL ? "Persistent breach without valid reclaim" : state == RETEST_EXPIRED ? "Retest did not occur within the configured window" : "Acceptance confirmed; waiting for retest"
-
 reasonDetail = conflictText == "NONE" ? "No recorded conflicts" : conflictText
 
 // ---------- COMPACT HUD ----------
@@ -389,7 +411,7 @@ if barstate.islast and showPanel
         table.cell(panel, 0, 36, "Conflict Types", text_size=textSize)
         table.cell(panel, 1, 36, conflictText, text_size=textSize)
         table.cell(panel, 0, 37, "Archived", text_size=textSize)
-        table.cell(panel, 1, 37, archivedSetupId > 0 ? "#" + str.tostring(archivedSetupId) + " / " + (archivedFinalState == RETEST_FAIL ? "FAIL" : archivedFinalState == RETEST_EXPIRED ? "EXPIRED" : stateText) : "NONE", text_size=textSize)
+        table.cell(panel, 1, 37, archivedSetupId > 0 ? "#" + str.tostring(archivedSetupId) + " / " + (archivedFinalState == RETEST_FAIL ? "FAIL" : archivedFinalState == RETEST_EXPIRED ? "EXPIRED" : "ARCHIVED") : "NONE", text_size=textSize)
         table.cell(panel, 0, 38, "Archived Accept", text_size=textSize)
         table.cell(panel, 1, 38, archivedSetupId > 0 ? str.tostring(archivedAcceptanceScore, "#.0") + " / 10" : "—", text_size=textSize)
         table.cell(panel, 0, 39, "Archived Retest", text_size=textSize)
