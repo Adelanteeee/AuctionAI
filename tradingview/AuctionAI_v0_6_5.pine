@@ -277,7 +277,6 @@ tradeState = retestHold and acceptedDirection == 1 and evidenceAlignment == "ALI
 reason = retestHold and evidenceAlignment == "ALIGNED" ? "Structure + order-flow evidence agree" : retestHold and evidenceAlignment == "CONFLICTED" ? "Retest holds but evidence conflicts" : retestHold ? "Retest holds but evidence is mixed" : retestFail ? "Accepted edge failed after retest" : retestWeak ? "Retest lacks sufficient confirming evidence" : retestBreached ? "Level breached — reclaim or persistent failure pending" : awaitingRetest ? "Acceptance occurred — wait for retest" : possibleAbsorption ? "High Effort / Low Result" : "Need More Information"
 
 var table panel = table.new(position.top_right, 2, 36, border_width=1)
-textSize = panelTextSize == "Tiny" ? size.tiny : panelTextSize == "Normal" ? size.normal : size.small
 if barstate.islast and showPanel
     table.clear(panel, 0, 0, 1, 35)
     table.cell(panel, 0, 0, "AuctionAI v0.6.5", text_size=textSize)
