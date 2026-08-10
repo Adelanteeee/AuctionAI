@@ -24,6 +24,7 @@ showEventLabels = input.bool(true, "Show Event Labels")
 showAcceptedLevel = input.bool(true, "Show Accepted Level")
 reclaimBarsRequired = input.int(1, "Reclaim Confirmation Bars", minval=1, maxval=3)
 reclaimFailureBars = input.int(1, "Reclaim Failure Confirmation Bars", minval=1, maxval=3)
+failureBarsRequired = input.int(2, "Breach Failure Confirmation Bars", minval=1, maxval=5)
 retestWindowBars = input.int(20, "Retest Window Bars", minval=1, maxval=100)
 confluenceStrongThreshold = input.int(7, "Strong Confluence Threshold", minval=1, maxval=10)
 showDiagnostics = input.bool(false, "Show Diagnostics")
@@ -198,16 +199,8 @@ hasAcceptedStructure = acceptedDirection != 0 and not na(acceptedLevel) and not 
 barsSinceAcceptance = hasAcceptedStructure ? bar_index - acceptanceBarIndex : 0
 stateAge = not na(stateSinceBar) ? bar_index - stateSinceBar : 0
 
-retestTouchUp =
-     (lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK) and
-     acceptedDirection == 1 and
-     low <= acceptedLevel and close >= acceptedLevel
-
-retestTouchDown =
-     (lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK) and
-     acceptedDirection == -1 and
-     high >= acceptedLevel and close <= acceptedLevel
-
+retestTouchUp = (lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK) and acceptedDirection == 1 and low <= acceptedLevel and close >= acceptedLevel
+retestTouchDown = (lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK) and acceptedDirection == -1 and high >= acceptedLevel and close <= acceptedLevel
 retestResultHigh = resultMagnitude > atr * retestResultATR
 retestDeltaAlignedUp = deltaProxy >= retestDeltaMin
 retestDeltaAlignedDown = deltaProxy <= -retestDeltaMin
@@ -225,7 +218,6 @@ breachDown = hasAcceptedStructure and (lifecycleState == STATE_WAIT_RETEST or li
 reclaimCandidateUp = lifecycleState == STATE_BREACH and acceptedDirection == 1 and close >= acceptedLevel
 reclaimCandidateDown = lifecycleState == STATE_BREACH and acceptedDirection == -1 and close <= acceptedLevel
 
-// Retest window: acceptance has a finite lifetime while waiting for the first retest.
 if lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK
     retestBars := barsSinceAcceptance
 
@@ -235,7 +227,6 @@ if (lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK) 
     breachBars := 0
     reclaimBars := 0
 
-// Weak is transitional and may upgrade to Hold.
 if lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK
     if retestConfirmedUp or retestConfirmedDown
         lifecycleState := STATE_RETEST_HOLD
@@ -247,8 +238,6 @@ if lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK
             stateSinceBar := bar_index
         lifecycleState := STATE_RETEST_WEAK
 
-// Breach: first bar is warning. Consecutive breach bars are counted here.
-// A non-breach/non-reclaim bar resets the consecutive failure count.
 if breachUp or breachDown
     if lifecycleState != STATE_BREACH
         lifecycleState := STATE_BREACH
@@ -258,7 +247,6 @@ if breachUp or breachDown
         breachBars += 1
     reclaimBars := 0
 
-// Breach monitoring: reclaim interrupts failure accumulation.
 if lifecycleState == STATE_BREACH and not (breachUp or breachDown)
     if reclaimCandidateUp or reclaimCandidateDown
         reclaimBars += 1
@@ -280,7 +268,6 @@ if lifecycleState == STATE_BREACH and breachBars >= failureBarsRequired
     breachBars := 0
     reclaimBars := 0
 
-// A held/reclaimed setup can later re-enter breach monitoring.
 if (lifecycleState == STATE_RETEST_HOLD or lifecycleState == STATE_RECLAIM) and (breachUp or breachDown)
     lifecycleState := STATE_BREACH
     stateSinceBar := bar_index
@@ -296,7 +283,7 @@ retestSeen = retestHold or retestWeak or retestFail or lifecycleState == STATE_R
 activeStructure = hasAcceptedStructure and (lifecycleState == STATE_WAIT_RETEST or lifecycleState == STATE_RETEST_WEAK or lifecycleState == STATE_RETEST_HOLD or lifecycleState == STATE_BREACH or lifecycleState == STATE_RECLAIM)
 
 retestState = lifecycleState == STATE_RETEST_HOLD ? "RETEST HOLD" : lifecycleState == STATE_RECLAIM ? "RECLAIM CONFIRMED" : lifecycleState == STATE_RETEST_FAIL ? "RETEST FAIL" : lifecycleState == STATE_RETEST_EXPIRED ? "RETEST EXPIRED" : lifecycleState == STATE_RETEST_WEAK ? "RETEST WEAK" : lifecycleState == STATE_BREACH ? "BREACH WARNING" : lifecycleState == STATE_WAIT_RETEST ? "AWAITING RETEST" : hasAcceptedStructure ? "ACCEPTED" : "NONE"
-retestQuality = retestHold ? (lifecycleState == STATE_RECLAIM ? "RECLAIM" : "CONFIRMED") : retestWeak ? "WEAK — MONITOR" : retestFail ? "FAIL" : retestBreached ? "BREACH WARNING" : awaitingRetest ? "PENDING" : "—"
+retestQuality = retestHold ? "CONFIRMED" : retestWeak ? "WEAK — MONITOR" : retestFail ? "FAIL" : retestBreached ? "BREACH WARNING" : awaitingRetest ? "PENDING" : "—"
 
 // 11. ACTIVE EVIDENCE / CONFLUENCE / CONFLICT
 acceptanceDirection = activeStructure ? acceptedDirection : 0
