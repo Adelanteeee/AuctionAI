@@ -1,0 +1,408 @@
+//@version=6
+indicator("AuctionAI v0.6.9 - Decision Audit & Setup Lifecycle Validation", overlay=true)
+
+// v0.6.9
+// Decision Audit + Setup Lifecycle Validation.
+// No execution, prediction, ML, optimization, or profit model is added.
+// Acceptance Score = Acceptance Evidence Quality Only.
+// Retest Score = Retest Evidence Quality Only.
+// Confluence = Evidence alignment. Confidence = overall setup quality.
+
+lookback = input.int(50, "Balance Lookback", minval=5)
+atrLength = input.int(14, "ATR Length", minval=1)
+volumeLength = input.int(20, "Volume Average Length", minval=2)
+deltaFastLen = input.int(20, "Delta Fast Length", minval=2)
+deltaSlowLen = input.int(50, "Delta Slow Length", minval=3)
+strongBodyATR = input.float(0.7, "Strong Body / ATR", minval=0.1, step=0.1)
+resultATR = input.float(0.5, "High Result / ATR", minval=0.1, step=0.1)
+acceptBarsRequired = input.int(2, "Acceptance Confirmation Bars", minval=1, maxval=5)
+retestDeltaMin = input.float(5.0, "Retest Delta Alignment Threshold", minval=0.0, step=1.0)
+retestResultATR = input.float(0.25, "Retest Result / ATR", minval=0.05, step=0.05)
+retestWindowBars = input.int(20, "Retest Window Bars", minval=1, maxval=100)
+reclaimBarsRequired = input.int(1, "Reclaim Confirmation Bars", minval=1, maxval=3)
+failureBarsRequired = input.int(2, "Breach Failure Confirmation Bars", minval=1, maxval=5)
+showPanel = input.bool(true, "Show Panel")
+showDiagnostics = input.bool(false, "Show Diagnostics")
+showBalance = input.bool(true, "Show Balance")
+showAcceptedLevel = input.bool(true, "Show Accepted Level")
+showSignals = input.bool(true, "Show Event Signals")
+panelTextSize = input.string("Small", "Panel Text Size", options=["Tiny", "Small", "Normal"])
+textSize = panelTextSize == "Tiny" ? size.tiny : panelTextSize == "Normal" ? size.normal : size.small
+
+// ---------- MARKET EVIDENCE ----------
+rangeHigh = ta.highest(high, lookback)[1]
+rangeLow = ta.lowest(low, lookback)[1]
+rangeSize = rangeHigh - rangeLow
+positionValue = rangeSize > 0 ? (close - rangeLow) / rangeSize : 0.5
+location = positionValue > 0.75 ? "UPPER VALUE" : positionValue < 0.25 ? "LOWER VALUE" : "MID VALUE"
+context = positionValue > 0.75 ? "UPPER" : positionValue < 0.25 ? "LOWER" : "BALANCE"
+atr = ta.atr(atrLength)
+body = math.abs(close - open)
+strongBody = body > atr * strongBodyATR
+breakoutUp = close > rangeHigh
+breakoutDown = close < rangeLow
+rejectUp = high > rangeHigh and close <= rangeHigh
+rejectDown = low < rangeLow and close >= rangeLow
+volumeAvg = ta.sma(volume, volumeLength)
+effortHigh = volume > volumeAvg
+resultMagnitude = math.abs(close - close[1])
+resultHigh = resultMagnitude > atr * resultATR
+retestResultHigh = resultMagnitude > atr * retestResultATR
+aRange = math.max(high - low, syminfo.mintick)
+buyPressure = ((close - low) / aRange) * 100.0
+sellPressure = ((high - close) / aRange) * 100.0
+deltaProxy = buyPressure - sellPressure
+deltaFast = ta.ema(deltaProxy, deltaFastLen)
+deltaSlow = ta.ema(deltaProxy, deltaSlowLen)
+cvdProxy = ta.cum(deltaProxy)
+cvdUp = deltaFast > deltaSlow
+cvdDown = deltaFast < deltaSlow
+deltaUp = deltaProxy > 0
+deltaDown = deltaProxy < 0
+possibleAbsorption = effortHigh and not resultHigh
+
+// ---------- ACCEPTANCE EVIDENCE ----------
+barScoreUp = (breakoutUp ? 2 : 0) + (breakoutUp and strongBody ? 1 : 0) + (breakoutUp and resultHigh ? 1 : 0) + (breakoutUp and deltaUp ? 2 : 0) + (breakoutUp and cvdUp ? 2 : 0) + (breakoutUp and effortHigh ? 1 : 0) - (breakoutUp and possibleAbsorption ? 3 : 0)
+barScoreDown = (breakoutDown ? 2 : 0) + (breakoutDown and strongBody ? 1 : 0) + (breakoutDown and resultHigh ? 1 : 0) + (breakoutDown and deltaDown ? 2 : 0) + (breakoutDown and cvdDown ? 2 : 0) + (breakoutDown and effortHigh ? 1 : 0) - (breakoutDown and possibleAbsorption ? 3 : 0)
+var int upAcceptanceBars = 0
+var int downAcceptanceBars = 0
+var float upScore = 0.0
+var float downScore = 0.0
+upAcceptanceBars := breakoutUp ? upAcceptanceBars + 1 : 0
+downAcceptanceBars := breakoutDown ? downAcceptanceBars + 1 : 0
+upScore := breakoutUp ? upScore + math.max(0, barScoreUp) : 0
+downScore := breakoutDown ? downScore + math.max(0, barScoreDown) : 0
+confirmedUp = upAcceptanceBars >= acceptBarsRequired
+confirmedDown = downAcceptanceBars >= acceptBarsRequired
+newAcceptUp = confirmedUp and not confirmedUp[1]
+newAcceptDown = confirmedDown and not confirmedDown[1]
+acceptanceScore = confirmedUp ? math.min(10.0, upScore) : confirmedDown ? math.min(10.0, downScore) : math.min(10.0, math.max(upScore, downScore))
+acceptanceQuality = acceptanceScore >= 9 ? "VERY STRONG" : acceptanceScore >= 6 ? "STRONG" : acceptanceScore >= 3 ? "DEVELOPING" : "WEAK"
+
+// ---------- LIFECYCLE ----------
+const int NONE = 0
+const int WAIT_RETEST = 1
+const int RETEST_WEAK = 2
+const int RETEST_HOLD = 3
+const int BREACH_WARNING = 4
+const int RECLAIM_CONFIRMED = 5
+const int RETEST_FAIL = 6
+const int RETEST_EXPIRED = 7
+
+var int state = NONE
+var int direction = 0
+var float acceptedLevel = na
+var int acceptanceIndex = na
+var int stateIndex = na
+var int breachCount = 0
+var int reclaimCount = 0
+var int setupId = 0
+var bool setupActive = false
+
+// ---------- ACTIVE SETUP SNAPSHOT ----------
+var float acceptanceDeltaSnap = na
+var int acceptanceCvdSnap = 0
+var float acceptanceResultSnap = na
+var float acceptanceEffortSnap = na
+var bool acceptanceAbsorptionSnap = false
+var float acceptanceScoreSnap = na
+var int acceptanceSnapshotBar = na
+
+var float retestDeltaSnap = na
+var int retestCvdSnap = 0
+var float retestResultSnap = na
+var float retestEffortSnap = na
+var bool retestAbsorptionSnap = false
+var float retestScoreSnap = na
+var int retestSnapshotBar = na
+var int retestStateAtSnapshot = NONE
+
+// ---------- ARCHIVED SETUP AUDIT ----------
+var int archivedSetupId = 0
+var int archivedDirection = 0
+var int archivedFinalState = NONE
+var int archivedAcceptanceBar = na
+var int archivedRetestBar = na
+var float archivedAcceptanceLevel = na
+var float archivedAcceptanceScore = na
+var float archivedRetestScore = na
+var int archivedAcceptanceCvd = 0
+var int archivedRetestCvd = 0
+var float archivedAcceptanceResult = na
+var float archivedRetestResult = na
+var bool archivedAcceptanceAbsorption = false
+var bool archivedRetestAbsorption = false
+var int archivedBreachCount = 0
+
+// ---------- SETUP RESET / ARCHIVE ----------
+archiveActiveSetup(_finalState) =>
+    if setupActive
+        archivedSetupId := setupId
+        archivedDirection := direction
+        archivedFinalState := _finalState
+        archivedAcceptanceBar := acceptanceSnapshotBar
+        archivedRetestBar := retestSnapshotBar
+        archivedAcceptanceLevel := acceptedLevel
+        archivedAcceptanceScore := acceptanceScoreSnap
+        archivedRetestScore := retestScoreSnap
+        archivedAcceptanceCvd := acceptanceCvdSnap
+        archivedRetestCvd := retestCvdSnap
+        archivedAcceptanceResult := acceptanceResultSnap
+        archivedRetestResult := retestResultSnap
+        archivedAcceptanceAbsorption := acceptanceAbsorptionSnap
+        archivedRetestAbsorption := retestAbsorptionSnap
+        archivedBreachCount := breachCount
+
+startNewSetup(_dir, _level) =>
+    setupId += 1
+    direction := _dir
+    acceptedLevel := _level
+    acceptanceIndex := bar_index
+    stateIndex := bar_index
+    state := WAIT_RETEST
+    setupActive := true
+    breachCount := 0
+    reclaimCount := 0
+    acceptanceDeltaSnap := deltaProxy
+    acceptanceCvdSnap := cvdUp ? 1 : cvdDown ? -1 : 0
+    acceptanceResultSnap := resultMagnitude / math.max(atr, syminfo.mintick)
+    acceptanceEffortSnap := volume / math.max(volumeAvg, 1.0)
+    acceptanceAbsorptionSnap := possibleAbsorption
+    acceptanceScoreSnap := math.min(10.0, acceptanceScore)
+    acceptanceSnapshotBar := bar_index
+    retestDeltaSnap := na
+    retestCvdSnap := 0
+    retestResultSnap := na
+    retestEffortSnap := na
+    retestAbsorptionSnap := false
+    retestScoreSnap := na
+    retestSnapshotBar := na
+    retestStateAtSnapshot := NONE
+
+// A new confirmed acceptance always starts a new setup and archives the previous one.
+if newAcceptUp or newAcceptDown
+    if setupActive
+        archiveActiveSetup(state)
+    startNewSetup(newAcceptUp ? 1 : -1, newAcceptUp ? rangeHigh : rangeLow)
+
+hasSetup = setupActive and not na(acceptedLevel) and not na(acceptanceIndex)
+barsSinceAcceptance = hasSetup ? bar_index - acceptanceIndex : 0
+stateAge = hasSetup and not na(stateIndex) ? bar_index - stateIndex : 0
+
+// ---------- RETEST ----------
+waitLike = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK)
+retestTouchUp = waitLike and direction == 1 and low <= acceptedLevel and close >= acceptedLevel
+retestTouchDown = waitLike and direction == -1 and high >= acceptedLevel and close <= acceptedLevel
+retestDeltaUp = deltaProxy >= retestDeltaMin
+retestDeltaDown = deltaProxy <= -retestDeltaMin
+retestReactionUp = close > open and close >= close[1]
+retestReactionDown = close < open and close <= close[1]
+retestHighEffortLowResult = effortHigh and not retestResultHigh
+retestHoldUp = retestTouchUp and retestReactionUp and retestResultHigh and retestDeltaUp and cvdUp and not retestHighEffortLowResult and not possibleAbsorption
+retestHoldDown = retestTouchDown and retestReactionDown and retestResultHigh and retestDeltaDown and cvdDown and not retestHighEffortLowResult and not possibleAbsorption
+retestTouched = retestTouchUp or retestTouchDown
+retestWeakNow = retestTouched and not (retestHoldUp or retestHoldDown)
+
+if retestTouched and na(retestSnapshotBar)
+    retestDeltaSnap := deltaProxy
+    retestCvdSnap := cvdUp ? 1 : cvdDown ? -1 : 0
+    retestResultSnap := resultMagnitude / math.max(atr, syminfo.mintick)
+    retestEffortSnap := volume / math.max(volumeAvg, 1.0)
+    retestAbsorptionSnap := possibleAbsorption
+    retestScoreSnap := math.min(10.0, math.max(0.0, (direction == 1 and retestDeltaUp or direction == -1 and retestDeltaDown ? 2 : 0) + (direction == 1 and cvdUp or direction == -1 and cvdDown ? 2 : 0) + (retestResultHigh ? 2 : 0) + (effortHigh and retestResultHigh ? 1 : 0) + (not possibleAbsorption ? 1 : 0)))
+    retestSnapshotBar := bar_index
+    retestStateAtSnapshot := retestHoldUp or retestHoldDown ? RETEST_HOLD : RETEST_WEAK
+
+// Expiry closes the setup and prevents old evidence from remaining active.
+if hasSetup and waitLike and barsSinceAcceptance >= retestWindowBars and not retestTouched
+    archiveActiveSetup(RETEST_EXPIRED)
+    setupActive := false
+    state := RETEST_EXPIRED
+    stateIndex := bar_index
+    breachCount := 0
+    reclaimCount := 0
+
+if hasSetup and waitLike and (retestHoldUp or retestHoldDown)
+    state := RETEST_HOLD
+    stateIndex := bar_index
+    breachCount := 0
+    reclaimCount := 0
+else if hasSetup and waitLike and retestWeakNow
+    if state != RETEST_WEAK
+        stateIndex := bar_index
+    state := RETEST_WEAK
+
+// ---------- BREACH / RECLAIM / FAILURE ----------
+breachUp = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK or state == RETEST_HOLD or state == RECLAIM_CONFIRMED) and direction == 1 and close < acceptedLevel
+breachDown = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK or state == RETEST_HOLD or state == RECLAIM_CONFIRMED) and direction == -1 and close > acceptedLevel
+reclaimCandidate = hasSetup and state == BREACH_WARNING and ((direction == 1 and close >= acceptedLevel) or (direction == -1 and close <= acceptedLevel))
+
+if breachUp or breachDown
+    breachCount := state == BREACH_WARNING ? breachCount + 1 : 1
+    reclaimCount := 0
+    if state != BREACH_WARNING
+        state := BREACH_WARNING
+        stateIndex := bar_index
+
+if hasSetup and state == BREACH_WARNING and reclaimCandidate
+    reclaimCount += 1
+    breachCount := 0
+    if reclaimCount >= reclaimBarsRequired
+        state := RECLAIM_CONFIRMED
+        stateIndex := bar_index
+        reclaimCount := 0
+
+if hasSetup and state == BREACH_WARNING and breachCount >= failureBarsRequired
+    archiveActiveSetup(RETEST_FAIL)
+    setupActive := false
+    state := RETEST_FAIL
+    stateIndex := bar_index
+    breachCount := 0
+    reclaimCount := 0
+
+// Reclaim is a confirmed lifecycle event but does not create an execution signal.
+
+// ---------- SNAPSHOT COMPARISON ----------
+acceptDeltaDirection = na(acceptanceDeltaSnap) ? "—" : acceptanceDeltaSnap > 0 ? "BUY" : acceptanceDeltaSnap < 0 ? "SELL" : "NEUTRAL"
+retestDeltaDirection = na(retestDeltaSnap) ? "—" : retestDeltaSnap > 0 ? "BUY" : retestDeltaSnap < 0 ? "SELL" : "NEUTRAL"
+acceptCvdDirection = acceptanceCvdSnap == 1 ? "RISING" : acceptanceCvdSnap == -1 ? "FALLING" : "FLAT"
+retestCvdDirection = retestCvdSnap == 1 ? "RISING" : retestCvdSnap == -1 ? "FALLING" : "FLAT"
+retestScoreAvailable = not na(retestScoreSnap)
+scoreChange = retestScoreAvailable and not na(acceptanceScoreSnap) ? retestScoreSnap - acceptanceScoreSnap : na
+evidenceTrend = not retestScoreAvailable ? "PENDING" : scoreChange >= 1 ? "STRENGTHENING" : scoreChange <= -1 ? "WEAKENING" : "STABLE"
+
+flowConflict = retestScoreAvailable and ((direction == 1 and retestDeltaDirection == "BUY" and retestCvdDirection == "FALLING") or (direction == -1 and retestDeltaDirection == "SELL" and retestCvdDirection == "RISING"))
+deltaComparisonConflict = retestScoreAvailable and ((direction == 1 and acceptDeltaDirection == "BUY" and retestDeltaDirection == "SELL") or (direction == -1 and acceptDeltaDirection == "SELL" and retestDeltaDirection == "BUY"))
+cvdComparisonConflict = retestScoreAvailable and ((acceptCvdDirection == "RISING" and retestCvdDirection == "FALLING") or (acceptCvdDirection == "FALLING" and retestCvdDirection == "RISING"))
+absorptionConflict = retestScoreAvailable and retestAbsorptionSnap
+resultConflict = retestScoreAvailable and not na(acceptanceResultSnap) and not na(retestResultSnap) and retestResultSnap < acceptanceResultSnap * 0.75
+conflictCount = (flowConflict ? 1 : 0) + (deltaComparisonConflict ? 1 : 0) + (cvdComparisonConflict ? 1 : 0) + (absorptionConflict ? 1 : 0) + (resultConflict ? 1 : 0)
+conflictText = conflictCount == 0 ? "NONE" : (flowConflict ? "FLOW: Delta/CVD; " : "") + (deltaComparisonConflict ? "Delta Decay; " : "") + (cvdComparisonConflict ? "CVD Decay; " : "") + (absorptionConflict ? "Absorption; " : "") + (resultConflict ? "Result Decay; " : "")
+
+// Per-evidence comparison for diagnostics.
+deltaAlignment = not retestScoreAvailable ? "PENDING" : deltaComparisonConflict ? "WEAKENING" : "ALIGNED"
+cvdAlignment = not retestScoreAvailable ? "PENDING" : cvdComparisonConflict ? "WEAKENING" : "ALIGNED"
+resultAlignment = not retestScoreAvailable ? "PENDING" : resultConflict ? "WEAKENING" : "STABLE"
+absorptionAlignment = not retestScoreAvailable ? "PENDING" : absorptionConflict ? "WORSE" : "STABLE"
+
+// ---------- CONFLUENCE / CONFIDENCE ----------
+activeStructure = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK or state == RETEST_HOLD or state == BREACH_WARNING or state == RECLAIM_CONFIRMED)
+priceAligned = activeStructure and (direction == 1 ? close >= acceptedLevel : close <= acceptedLevel)
+deltaAligned = activeStructure and (direction == 1 ? deltaUp : deltaDown)
+cvdAligned = activeStructure and (direction == 1 ? cvdUp : cvdDown)
+resultAligned = activeStructure and (direction == 1 ? close >= close[1] and resultHigh : close <= close[1] and resultHigh)
+noAbsorption = activeStructure and not possibleAbsorption
+retestAligned = state == RETEST_HOLD and retestScoreAvailable and conflictCount == 0
+confluenceScore = (priceAligned ? 2 : 0) + (deltaAligned ? 2 : 0) + (cvdAligned ? 2 : 0) + (resultAligned ? 1 : 0) + (noAbsorption ? 1 : 0) + (retestAligned ? 2 : 0)
+confluenceScoreClamped = math.max(0, math.min(10, confluenceScore))
+
+acceptQualityStrong = not na(acceptanceScoreSnap) and acceptanceScoreSnap >= 6
+retestQualityStrong = retestScoreAvailable and retestScoreSnap >= 6
+confidence = not activeStructure ? "LOW" : state == RETEST_HOLD and acceptQualityStrong and retestQualityStrong and evidenceTrend != "WEAKENING" and conflictCount == 0 ? "HIGH" : acceptQualityStrong and retestScoreAvailable and confluenceScoreClamped >= 4 and conflictCount <= 1 ? "MEDIUM" : "LOW"
+
+// ---------- DECISION AUDIT ----------
+stateText = state == WAIT_RETEST ? "WAIT RETEST" : state == RETEST_WEAK ? "RETEST WEAK" : state == RETEST_HOLD ? "RETEST HOLD" : state == BREACH_WARNING ? "BREACH WARNING" : state == RECLAIM_CONFIRMED ? "RECLAIM CONFIRMED" : state == RETEST_FAIL ? "RETEST FAIL" : state == RETEST_EXPIRED ? "RETEST EXPIRED" : "NONE"
+
+decision = state == RETEST_HOLD and direction == 1 and conflictCount == 0 ? "LONG BIAS" : state == RETEST_HOLD and direction == -1 and conflictCount == 0 ? "SHORT BIAS" : state == RETEST_HOLD ? "HOLD / CONFLICT" : state == RETEST_WEAK ? "WEAK" : state == BREACH_WARNING ? "BREACH" : state == RECLAIM_CONFIRMED ? "RECLAIM" : state == RETEST_FAIL ? "FAIL" : state == RETEST_EXPIRED ? "EXPIRED" : "WAIT"
+
+reason = state == RETEST_HOLD and conflictCount == 0 ? "Acceptance preserved; Retest held; no major conflict" : state == RETEST_HOLD ? "Retest held but evidence conflicts remain" : state == RETEST_WEAK ? "Retest touched level but evidence weakened / is insufficient" : state == BREACH_WARNING ? "Accepted level violated; reclaim or failure pending" : state == RECLAIM_CONFIRMED ? "Price reclaimed accepted level with required confirmation" : state == RETEST_FAIL ? "Persistent breach without valid reclaim" : state == RETEST_EXPIRED ? "Retest did not occur within the configured window" : "Acceptance confirmed; waiting for retest"
+
+reasonDetail = conflictText == "NONE" ? "No recorded conflicts" : conflictText
+
+// ---------- COMPACT HUD ----------
+var table panel = table.new(position.top_right, 2, 40, border_width=1)
+if barstate.islast and showPanel
+    table.clear(panel, 0, 0, 1, 39)
+    table.cell(panel, 0, 0, "AuctionAI v0.6.9", text_size=textSize)
+    table.cell(panel, 1, 0, "DECISION AUDIT", text_size=textSize)
+    table.cell(panel, 0, 1, "Setup", text_size=textSize)
+    table.cell(panel, 1, 1, setupActive ? "#" + str.tostring(setupId) : "ARCHIVED #" + str.tostring(archivedSetupId), text_size=textSize)
+    table.cell(panel, 0, 2, "Context", text_size=textSize)
+    table.cell(panel, 1, 2, context, text_size=textSize)
+    table.cell(panel, 0, 3, "Location", text_size=textSize)
+    table.cell(panel, 1, 3, location, text_size=textSize)
+    table.cell(panel, 0, 4, "Lifecycle", text_size=textSize)
+    table.cell(panel, 1, 4, stateText, text_size=textSize)
+    table.cell(panel, 0, 5, "Acceptance", text_size=textSize)
+    table.cell(panel, 1, 5, setupActive ? (direction == 1 ? "CONFIRMED UP" : "CONFIRMED DOWN") : "ARCHIVED", text_size=textSize)
+    table.cell(panel, 0, 6, "Accept Score", text_size=textSize)
+    table.cell(panel, 1, 6, na(acceptanceScoreSnap) ? "—" : str.tostring(acceptanceScoreSnap, "#.0") + " / 10", text_size=textSize)
+    table.cell(panel, 0, 7, "Retest", text_size=textSize)
+    table.cell(panel, 1, 7, stateText, text_size=textSize)
+    table.cell(panel, 0, 8, "Retest Score", text_size=textSize)
+    table.cell(panel, 1, 8, retestScoreAvailable ? str.tostring(retestScoreSnap, "#.0") + " / 10" : "—", text_size=textSize)
+    table.cell(panel, 0, 9, "Evidence", text_size=textSize)
+    table.cell(panel, 1, 9, evidenceTrend, text_size=textSize)
+    table.cell(panel, 0, 10, "Conflicts", text_size=textSize)
+    table.cell(panel, 1, 10, str.tostring(conflictCount), text_size=textSize)
+    table.cell(panel, 0, 11, "Confluence", text_size=textSize)
+    table.cell(panel, 1, 11, str.tostring(confluenceScoreClamped) + " / 10", text_size=textSize)
+    table.cell(panel, 0, 12, "Decision", text_size=textSize)
+    table.cell(panel, 1, 12, decision, text_size=textSize)
+    table.cell(panel, 0, 13, "Confidence", text_size=textSize)
+    table.cell(panel, 1, 13, confidence, text_size=textSize)
+    table.cell(panel, 0, 14, "Why", text_size=textSize)
+    table.cell(panel, 1, 14, reason, text_size=textSize)
+    table.cell(panel, 0, 15, "Why Detail", text_size=textSize)
+    table.cell(panel, 1, 15, reasonDetail, text_size=textSize)
+    table.cell(panel, 0, 16, "State Age", text_size=textSize)
+    table.cell(panel, 1, 16, setupActive ? str.tostring(stateAge) + " bars" : "—", text_size=textSize)
+    table.cell(panel, 0, 17, "Retest Window", text_size=textSize)
+    table.cell(panel, 1, 17, setupActive ? str.tostring(barsSinceAcceptance) + " / " + str.tostring(retestWindowBars) : "—", text_size=textSize)
+    if showDiagnostics
+        table.cell(panel, 0, 18, "── AUDIT ──", text_size=textSize)
+        table.cell(panel, 1, 18, "SETUP #" + str.tostring(setupId), text_size=textSize)
+        table.cell(panel, 0, 19, "Accept Bar", text_size=textSize)
+        table.cell(panel, 1, 19, na(acceptanceSnapshotBar) ? "—" : str.tostring(acceptanceSnapshotBar), text_size=textSize)
+        table.cell(panel, 0, 20, "Accept Level", text_size=textSize)
+        table.cell(panel, 1, 20, na(acceptedLevel) ? "—" : str.tostring(acceptedLevel, format.mintick), text_size=textSize)
+        table.cell(panel, 0, 21, "Accept Delta", text_size=textSize)
+        table.cell(panel, 1, 21, acceptDeltaDirection, text_size=textSize)
+        table.cell(panel, 0, 22, "Accept CVD", text_size=textSize)
+        table.cell(panel, 1, 22, acceptCvdDirection, text_size=textSize)
+        table.cell(panel, 0, 23, "Accept Result", text_size=textSize)
+        table.cell(panel, 1, 23, na(acceptanceResultSnap) ? "—" : str.tostring(acceptanceResultSnap, "#.00") + " ATR", text_size=textSize)
+        table.cell(panel, 0, 24, "Accept Effort", text_size=textSize)
+        table.cell(panel, 1, 24, na(acceptanceEffortSnap) ? "—" : str.tostring(acceptanceEffortSnap, "#.00") + "x", text_size=textSize)
+        table.cell(panel, 0, 25, "Accept Absorp.", text_size=textSize)
+        table.cell(panel, 1, 25, acceptanceAbsorptionSnap ? "PRESENT" : "NONE", text_size=textSize)
+        table.cell(panel, 0, 26, "Retest Bar", text_size=textSize)
+        table.cell(panel, 1, 26, na(retestSnapshotBar) ? "—" : str.tostring(retestSnapshotBar), text_size=textSize)
+        table.cell(panel, 0, 27, "Retest Delta", text_size=textSize)
+        table.cell(panel, 1, 27, retestDeltaDirection, text_size=textSize)
+        table.cell(panel, 0, 28, "Retest CVD", text_size=textSize)
+        table.cell(panel, 1, 28, retestCvdDirection, text_size=textSize)
+        table.cell(panel, 0, 29, "Retest Result", text_size=textSize)
+        table.cell(panel, 1, 29, na(retestResultSnap) ? "—" : str.tostring(retestResultSnap, "#.00") + " ATR", text_size=textSize)
+        table.cell(panel, 0, 30, "Retest Effort", text_size=textSize)
+        table.cell(panel, 1, 30, na(retestEffortSnap) ? "—" : str.tostring(retestEffortSnap, "#.00") + "x", text_size=textSize)
+        table.cell(panel, 0, 31, "Retest Absorp.", text_size=textSize)
+        table.cell(panel, 1, 31, retestAbsorptionSnap ? "PRESENT" : "NONE", text_size=textSize)
+        table.cell(panel, 0, 32, "Delta Compare", text_size=textSize)
+        table.cell(panel, 1, 32, deltaAlignment, text_size=textSize)
+        table.cell(panel, 0, 33, "CVD Compare", text_size=textSize)
+        table.cell(panel, 1, 33, cvdAlignment, text_size=textSize)
+        table.cell(panel, 0, 34, "Result Compare", text_size=textSize)
+        table.cell(panel, 1, 34, resultAlignment, text_size=textSize)
+        table.cell(panel, 0, 35, "Absorp Compare", text_size=textSize)
+        table.cell(panel, 1, 35, absorptionAlignment, text_size=textSize)
+        table.cell(panel, 0, 36, "Conflict Types", text_size=textSize)
+        table.cell(panel, 1, 36, conflictText, text_size=textSize)
+        table.cell(panel, 0, 37, "Archived", text_size=textSize)
+        table.cell(panel, 1, 37, archivedSetupId > 0 ? "#" + str.tostring(archivedSetupId) + " / " + (archivedFinalState == RETEST_FAIL ? "FAIL" : archivedFinalState == RETEST_EXPIRED ? "EXPIRED" : stateText) : "NONE", text_size=textSize)
+        table.cell(panel, 0, 38, "Archived Accept", text_size=textSize)
+        table.cell(panel, 1, 38, archivedSetupId > 0 ? str.tostring(archivedAcceptanceScore, "#.0") + " / 10" : "—", text_size=textSize)
+        table.cell(panel, 0, 39, "Archived Retest", text_size=textSize)
+        table.cell(panel, 1, 39, archivedSetupId > 0 and not na(archivedRetestScore) ? str.tostring(archivedRetestScore, "#.0") + " / 10" : "—", text_size=textSize)
+
+// ---------- PRICE-SCALE-SAFE VISUALS ----------
+plot(showBalance ? rangeHigh : na, "Balance High")
+plot(showBalance ? rangeLow : na, "Balance Low")
+plot(showAcceptedLevel and activeStructure ? acceptedLevel : na, "Accepted Level")
+plotshape(showSignals and newAcceptUp, title="Acceptance Up", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="A↑")
+plotshape(showSignals and newAcceptDown, title="Acceptance Down", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="A↓")
+plotshape(showSignals and state == RETEST_HOLD and state[1] != RETEST_HOLD, title="Retest Hold", style=shape.circle, location=location.belowbar, size=size.tiny, text="H")
+plotshape(showSignals and state == RETEST_WEAK and state[1] != RETEST_WEAK, title="Retest Weak", style=shape.diamond, location=location.abovebar, size=size.tiny, text="W")
+plotshape(showSignals and state == BREACH_WARNING and state[1] != BREACH_WARNING, title="Breach Warning", style=shape.xcross, location=location.abovebar, size=size.tiny, text="B")
+plotshape(showSignals and state == RECLAIM_CONFIRMED and state[1] != RECLAIM_CONFIRMED, title="Reclaim Confirmed", style=shape.circle, location=location.belowbar, size=size.tiny, text="RC")
+plotshape(showSignals and state == RETEST_FAIL and state[1] != RETEST_FAIL, title="Retest Fail", style=shape.xcross, location=location.abovebar, size=size.tiny, text="F")
