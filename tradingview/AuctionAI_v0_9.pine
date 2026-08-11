@@ -1,7 +1,7 @@
 //@version=6
 indicator("AuctionAI v0.9 - Outcome Tracking & Decision Validation", overlay=true)
 
-// v0.9 — Outcome Tracking & Decision Validation
+// v0.9 — Outcome Tracking, Validation & Outcome Archive
 // Extends v0.8 with decision-to-outcome tracking, configurable horizons,
 // MFE/MAE, outcome classification, timing quality and validation.
 // Outcome is price behavior after a Decision Snapshot — NOT a trade, P&L,
@@ -31,6 +31,7 @@ recoveryConfirmBars = input.int(2, "Recovery Confirmation Bars", minval=1, maxva
 outcomeFavorableATR = input.float(0.5, "Outcome Favorable Threshold / ATR", minval=0.05, step=0.05)
 outcomeAdverseATR = input.float(0.5, "Outcome Adverse Threshold / ATR", minval=0.05, step=0.05)
 outcomeValidationHorizon = input.int(5, "Validation Horizon", options=[1, 3, 5, 10, 20])
+maxOutcomeArchiveRecords = input.int(500, "Outcome Archive Records", minval=10, maxval=5000)
 showPanel = input.bool(true, "Show Panel")
 showDiagnostics = input.bool(false, "Show Diagnostics")
 showBalance = input.bool(true, "Show Balance")
@@ -236,8 +237,7 @@ acceptDeltaDir = na(acceptanceDeltaSnap) ? 0 : acceptanceDeltaSnap > 0 ? 1 : acc
 retestDeltaDir = na(retestDeltaSnap) ? 0 : retestDeltaSnap > 0 ? 1 : retestDeltaSnap < 0 ? -1 : 0
 flowConflict = retestScoreAvailable and ((direction == 1 and retestDeltaDir == 1 and retestCvdSnap == -1) or (direction == -1 and retestDeltaDir == -1 and retestCvdSnap == 1))
 deltaComparisonConflict = retestScoreAvailable and acceptDeltaDir != 0 and retestDeltaDir != 0 and acceptDeltaDir != retestDeltaDir
-cvdComparisonConflict = retestScoreAvailable and acceptanceCvdSnap != 0 and retestCvdSnap != 0 and acceptanceCvdSnap != acceptanceCvdSnap
-cvdComparisonConflict := retestScoreAvailable and acceptanceCvdSnap != 0 and retestCvdSnap != 0 and acceptanceCvdSnap != retestCvdSnap
+cvdComparisonConflict = retestScoreAvailable and acceptanceCvdSnap != 0 and retestCvdSnap != 0 and acceptanceCvdSnap != retestCvdSnap
 absorptionConflict = retestScoreAvailable and retestAbsorptionSnap
 resultConflict = retestScoreAvailable and not na(acceptanceResultSnap) and not na(retestResultSnap) and retestResultSnap < acceptanceResultSnap * 0.75
 conflictCount = (flowConflict ? 1 : 0) + (deltaComparisonConflict ? 1 : 0) + (cvdComparisonConflict ? 1 : 0) + (absorptionConflict ? 1 : 0) + (resultConflict ? 1 : 0)
@@ -429,12 +429,95 @@ var int firstFavorableBar = na
 var int firstAdverseBar = na
 var string timingQuality = "PENDING"
 var string validation = "PENDING"
+var string outcomeDecisionText = "NONE"
+var string outcomeDecisionQuality = "LOW"
+var string outcomeDecisionConfidence = "LOW"
+
+// ---------- OUTCOME ARCHIVE ----------
+// Active Outcome is always the current Decision Snapshot.
+// Completed/interrupted Outcomes are copied into immutable archive records so
+// later Setups cannot reset historical results.
+var outcomeArchiveSetupIds = array.new_int()
+var outcomeArchiveDirections = array.new_int()
+var outcomeArchiveStartBars = array.new_int()
+var outcomeArchiveEndBars = array.new_int()
+var outcomeArchiveReferencePrices = array.new_float()
+var outcomeArchiveMFE = array.new_float()
+var outcomeArchiveMAE = array.new_float()
+var outcomeArchiveH1 = array.new_float()
+var outcomeArchiveH3 = array.new_float()
+var outcomeArchiveH5 = array.new_float()
+var outcomeArchiveH10 = array.new_float()
+var outcomeArchiveH20 = array.new_float()
+var outcomeArchiveH1Class = array.new_string()
+var outcomeArchiveH3Class = array.new_string()
+var outcomeArchiveH5Class = array.new_string()
+var outcomeArchiveH10Class = array.new_string()
+var outcomeArchiveH20Class = array.new_string()
+var outcomeArchiveTiming = array.new_string()
+var outcomeArchiveValidation = array.new_string()
+var outcomeArchiveDecision = array.new_string()
+var outcomeArchiveQuality = array.new_string()
+var outcomeArchiveConfidence = array.new_string()
+
+archiveCurrentOutcome() =>
+    array.push(outcomeArchiveSetupIds, outcomeSetupId)
+    array.push(outcomeArchiveDirections, outcomeDirection)
+    array.push(outcomeArchiveStartBars, outcomeStartBar)
+    array.push(outcomeArchiveEndBars, bar_index)
+    array.push(outcomeArchiveReferencePrices, outcomeReferencePrice)
+    array.push(outcomeArchiveMFE, outcomeMFE)
+    array.push(outcomeArchiveMAE, outcomeMAE)
+    array.push(outcomeArchiveH1, outcomeH1)
+    array.push(outcomeArchiveH3, outcomeH3)
+    array.push(outcomeArchiveH5, outcomeH5)
+    array.push(outcomeArchiveH10, outcomeH10)
+    array.push(outcomeArchiveH20, outcomeH20)
+    array.push(outcomeArchiveH1Class, outcomeH1Class)
+    array.push(outcomeArchiveH3Class, outcomeH3Class)
+    array.push(outcomeArchiveH5Class, outcomeH5Class)
+    array.push(outcomeArchiveH10Class, outcomeH10Class)
+    array.push(outcomeArchiveH20Class, outcomeH20Class)
+    array.push(outcomeArchiveTiming, timingQuality)
+    archiveValidation = validation == "PENDING" ? "INTERRUPTED" : validation
+    array.push(outcomeArchiveValidation, archiveValidation)
+    array.push(outcomeArchiveDecision, outcomeDecisionText)
+    array.push(outcomeArchiveQuality, outcomeDecisionQuality)
+    array.push(outcomeArchiveConfidence, outcomeDecisionConfidence)
+    while array.size(outcomeArchiveSetupIds) > maxOutcomeArchiveRecords
+        array.shift(outcomeArchiveSetupIds)
+        array.shift(outcomeArchiveDirections)
+        array.shift(outcomeArchiveStartBars)
+        array.shift(outcomeArchiveEndBars)
+        array.shift(outcomeArchiveReferencePrices)
+        array.shift(outcomeArchiveMFE)
+        array.shift(outcomeArchiveMAE)
+        array.shift(outcomeArchiveH1)
+        array.shift(outcomeArchiveH3)
+        array.shift(outcomeArchiveH5)
+        array.shift(outcomeArchiveH10)
+        array.shift(outcomeArchiveH20)
+        array.shift(outcomeArchiveH1Class)
+        array.shift(outcomeArchiveH3Class)
+        array.shift(outcomeArchiveH5Class)
+        array.shift(outcomeArchiveH10Class)
+        array.shift(outcomeArchiveH20Class)
+        array.shift(outcomeArchiveTiming)
+        array.shift(outcomeArchiveValidation)
+        array.shift(outcomeArchiveDecision)
+        array.shift(outcomeArchiveQuality)
+        array.shift(outcomeArchiveConfidence)
 
 newOutcomeDecision = newLongDecision or newShortDecision
 if newOutcomeDecision
+    if outcomeActive
+        archiveCurrentOutcome()
     outcomeActive := true
     outcomeSetupId := setupId
     outcomeDirection := decisionState == DEC_LONG ? 1 : -1
+    outcomeDecisionText := decisionState == DEC_LONG ? "LONG BIAS" : "SHORT BIAS"
+    outcomeDecisionQuality := decisionQuality
+    outcomeDecisionConfidence := decisionConfidence
     outcomeStartBar := bar_index
     outcomeReferencePrice := close
     outcomeReferenceATR := math.max(atr, syminfo.mintick)
@@ -501,6 +584,8 @@ if outcomeActive and na(timingQuality) == false
 
 if outcomeActive and barsFromOutcome >= outcomeValidationHorizon and not na(selectedOutcome)
     validation := selectedOutcomeClass == "FAVORABLE" ? "VALIDATED" : selectedOutcomeClass == "ADVERSE" ? "FAILED" : "NEUTRAL"
+    archiveCurrentOutcome()
+    outcomeActive := false
 
 outcomeClassText = outcomeActive ? selectedOutcomeClass : "NONE"
 mfeSignedATR = outcomeActive ? outcomeMFE / math.max(outcomeReferenceATR, syminfo.mintick) : na
@@ -607,8 +692,8 @@ if barstate.islast and showPanel
         table.cell(panel, 1, 46, "H" + str.tostring(outcomeValidationHorizon), text_size=textSize)
         table.cell(panel, 0, 47, "Outcome Thresholds", text_size=textSize)
         table.cell(panel, 1, 47, "+" + str.tostring(outcomeFavorableATR, "#.##") + " / -" + str.tostring(outcomeAdverseATR, "#.##") + " ATR", text_size=textSize)
-        table.cell(panel, 0, 48, "MFE / MAE State", text_size=textSize)
-        table.cell(panel, 1, 48, outcomeActive ? "TRACKING" : "IDLE", text_size=textSize)
+        table.cell(panel, 0, 48, "Outcome Archive", text_size=textSize)
+        table.cell(panel, 1, 48, str.tostring(array.size(outcomeArchiveSetupIds)) + " records", text_size=textSize)
         table.cell(panel, 0, 49, "Execution", text_size=textSize)
         table.cell(panel, 1, 49, "NOT INCLUDED", text_size=textSize)
 
