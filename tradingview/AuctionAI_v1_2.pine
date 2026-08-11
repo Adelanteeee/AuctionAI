@@ -51,8 +51,6 @@ effortAligned = effortRatio >= 1.0
 resultAligned = body != 0 and resultRatio >= 0.5
 
 // ========================= DECISION REFERENCE =========================
-// Standalone compatibility layer. A new research record starts only when
-// the previous outcome has completed its archive horizon.
 strongLong = close > open and barRange > atrSafe * 0.75
 strongShort = close < open and barRange > atrSafe * 0.75
 candidateDirection = strongLong ? 1 : strongShort ? -1 : 0
@@ -127,7 +125,6 @@ if newDecision
     decisionQuality := barRange > atrSafe ? "HIGH" : "MEDIUM"
     decisionConfidence := barRange > atrSafe * 1.25 ? "HIGH" : "MEDIUM"
     decisionHealth := "HEALTHY"
-
     outcomeActive := true
     outcomeSetupId := nextSetupId
     outcomeDirection := decisionDirection
@@ -164,7 +161,6 @@ if outcomeActive
     signedLow = outcomeDirection > 0 ? low - outcomeReference : outcomeReference - high
     outcomeMfe := math.max(outcomeMfe, signedHigh)
     outcomeMae := math.min(outcomeMae, signedLow)
-
     barsElapsed = bar_index - outcomeStartBar
     currentMoveAtr = (close - outcomeReference) / outcomeAtr * outcomeDirection
 
@@ -245,9 +241,6 @@ lift(_rate, _baseline) => not na(_rate) and not na(_baseline) ? _rate - _baselin
 fmtPct(_x) => na(_x) ? "-" : str.tostring(_x, "#.0") + "%"
 fmtLift(_x) => na(_x) ? "-" : (_x >= 0 ? "+" : "") + str.tostring(_x, "#.0") + " pp"
 
-// Recommendation logic is deliberately conservative.
-// Explicit float typing on evaluation arguments allows intentional na values
-// for evidence buckets that do not yet have a valid OOS calculation.
 recommendation(_count, _researchRate, _researchBaseline, float _evalRate, float _evalBaseline, _r1, _r2, _r3, _currentWeight, _isNegative) =>
     researchLift = lift(_researchRate, _researchBaseline)
     evalLift = lift(_evalRate, _evalBaseline)
@@ -275,7 +268,6 @@ evalBaseW = 0
 researchBaseN = 0
 researchBaseW = 0
 
-// Research buckets for each evidence.
 dTN = 0
 dTW = 0
 cTN = 0
@@ -287,7 +279,6 @@ rTW = 0
 absN = 0
 absW = 0
 
-// Direction-conditioned buckets.
 dLongN = 0
 dLongW = 0
 dShortN = 0
@@ -297,23 +288,19 @@ cLongW = 0
 cShortN = 0
 cShortW = 0
 
-// Context-conditioned buckets.
 cTrendN = 0
 cTrendW = 0
 cRangeN = 0
 cRangeW = 0
 
-// Retest-conditioned buckets.
 cHoldN = 0
 cHoldW = 0
 cWeakN = 0
 cWeakW = 0
 
-// Interactions.
 dcN = 0
 dcW = 0
 
-// Stability buckets: chronological thirds of research sample.
 dR1N = 0
 dR1W = 0
 dR2N = 0
@@ -452,11 +439,11 @@ evalCTrendRate = rate(evalCTrendW, evalCTrendN)
 evalCHoldRate = rate(evalCHoldW, evalCHoldN)
 
 // ========================= RECOMMENDATIONS =========================
-[dRec, dDelta, dStrength, dStatus, dResearchLift, dOosLift, dStable] = recommendation(dTN, dRate, researchBaseline, evalDRate, evalBaseline, dR1Rate, dR2Rate, dR3Rate, weightDelta, false)
-[cRec, cDelta, cStrength, cStatus, cResearchLift, cOosLift, cStable] = recommendation(cTN, cRate, researchBaseline, evalCRate, evalBaseline, cRate, cRate, cRate, weightCvd, false)
-[eRec, eDelta, eStrength, eStatus, eResearchLift, eOosLift, eStable] = recommendation(eTN, eRate, researchBaseline, float(na), evalBaseline, eRate, eRate, eRate, weightEffort, false)
-[rRec, rDelta, rStrength, rStatus, rResearchLift, rOosLift, rStable] = recommendation(rTN, rRate, researchBaseline, float(na), evalBaseline, rRate, rRate, rRate, weightResult, false)
-[aRec, aDelta, aStrength, aStatus, aResearchLift, aOosLift, aStable] = recommendation(absN, absRate, researchBaseline, evalAbsRate, evalBaseline, absRate, absRate, absRate, weightAbsorption, true)
+[dRec, dWeightDelta, dStrength, dStatus, dResearchLift, dOosLift, dStable] = recommendation(dTN, dRate, researchBaseline, evalDRate, evalBaseline, dR1Rate, dR2Rate, dR3Rate, weightDelta, false)
+[cRec, cWeightDelta, cStrength, cStatus, cResearchLift, cOosLift, cStable] = recommendation(cTN, cRate, researchBaseline, evalCRate, evalBaseline, cRate, cRate, cRate, weightCvd, false)
+[eRec, eWeightDelta, eStrength, eStatus, eResearchLift, eOosLift, eStable] = recommendation(eTN, eRate, researchBaseline, float(na), evalBaseline, eRate, eRate, eRate, weightEffort, false)
+[rRec, rWeightDelta, rStrength, rStatus, rResearchLift, rOosLift, rStable] = recommendation(rTN, rRate, researchBaseline, float(na), evalBaseline, rRate, rRate, rRate, weightResult, false)
+[aRec, aWeightDelta, aStrength, aStatus, aResearchLift, aOosLift, aStable] = recommendation(absN, absRate, researchBaseline, evalAbsRate, evalBaseline, absRate, absRate, absRate, weightAbsorption, true)
 
 // Direction/context/retest recommendations are research diagnostics, not weight changes.
 cLongLift = lift(cLongRate, researchBaseline)
@@ -471,14 +458,14 @@ cLongOosLift = lift(evalCLongRate, evalBaseline)
 cTrendOosLift = lift(evalCTrendRate, evalBaseline)
 cHoldOosLift = lift(evalCHoldRate, evalBaseline)
 
-contextStatus(_n, _lift, _oos) => _n < recommendationMinSamples ? "INSUFFICIENT" : not na(_lift) and _lift >= 8 and not na(_oos) and _oos >= 3 ? "HIGH" : not na(_lift) and _lift >= 5 ? "MEDIUM" : "LOW"
+contextStatus(_n, _lift, float _oos) => _n < recommendationMinSamples ? "INSUFFICIENT" : not na(_lift) and _lift >= 8 and not na(_oos) and _oos >= 3 ? "HIGH" : not na(_lift) and _lift >= 5 ? "MEDIUM" : "LOW"
 
 cLongStatus = contextStatus(cLongN, cLongLift, cLongOosLift)
-cShortStatus = contextStatus(cShortN, cShortLift, na)
+cShortStatus = contextStatus(cShortN, cShortLift, float(na))
 cTrendStatus = contextStatus(cTrendN, cTrendLift, cTrendOosLift)
-cRangeStatus = contextStatus(cRangeN, cRangeLift, na)
+cRangeStatus = contextStatus(cRangeN, cRangeLift, float(na))
 cHoldStatus = contextStatus(cHoldN, cHoldLift, cHoldOosLift)
-cWeakStatus = contextStatus(cWeakN, cWeakLift, na)
+cWeakStatus = contextStatus(cWeakN, cWeakLift, float(na))
 interactionStatus = dcN < recommendationMinSamples ? "INSUFFICIENT" : not na(interactionLift) and interactionLift >= 10 ? "STRONG" : not na(interactionLift) and interactionLift >= 5 ? "MODERATE" : "HOLD"
 
 // ========================= HUD =========================
@@ -503,35 +490,35 @@ if barstate.islast
     table.cell(hud, 0, 2, "DELTA")
     table.cell(hud, 1, 2, str.tostring(weightDelta))
     table.cell(hud, 2, 2, str.tostring(dRec))
-    table.cell(hud, 3, 2, str.tostring(dDelta))
+    table.cell(hud, 3, 2, str.tostring(dWeightDelta))
     table.cell(hud, 4, 2, dStrength)
     table.cell(hud, 5, 2, dStatus)
 
     table.cell(hud, 0, 3, "CVD")
     table.cell(hud, 1, 3, str.tostring(weightCvd))
     table.cell(hud, 2, 3, str.tostring(cRec))
-    table.cell(hud, 3, 3, str.tostring(cDelta))
+    table.cell(hud, 3, 3, str.tostring(cWeightDelta))
     table.cell(hud, 4, 3, cStrength)
     table.cell(hud, 5, 3, cStatus)
 
     table.cell(hud, 0, 4, "EFFORT")
     table.cell(hud, 1, 4, str.tostring(weightEffort))
     table.cell(hud, 2, 4, str.tostring(eRec))
-    table.cell(hud, 3, 4, str.tostring(eDelta))
+    table.cell(hud, 3, 4, str.tostring(eWeightDelta))
     table.cell(hud, 4, 4, eStrength)
     table.cell(hud, 5, 4, eStatus)
 
     table.cell(hud, 0, 5, "RESULT")
     table.cell(hud, 1, 5, str.tostring(weightResult))
     table.cell(hud, 2, 5, str.tostring(rRec))
-    table.cell(hud, 3, 5, str.tostring(rDelta))
+    table.cell(hud, 3, 5, str.tostring(rWeightDelta))
     table.cell(hud, 4, 5, rStrength)
     table.cell(hud, 5, 5, rStatus)
 
     table.cell(hud, 0, 6, "ABSORPTION")
     table.cell(hud, 1, 6, str.tostring(weightAbsorption))
     table.cell(hud, 2, 6, str.tostring(aRec))
-    table.cell(hud, 3, 6, str.tostring(aDelta))
+    table.cell(hud, 3, 6, str.tostring(aWeightDelta))
     table.cell(hud, 4, 6, aStrength)
     table.cell(hud, 5, 6, aStatus)
 
