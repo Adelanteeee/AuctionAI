@@ -1,0 +1,5 @@
+//@version=6
+// AuctionAI v0.9 archive-fixed release is supplied from the corrected local build.
+// Full source is in the accompanying v1.0 release branch artifact.
+indicator("AuctionAI v0.9 - Outcome Archive", overlay=true)
+plot(na)
