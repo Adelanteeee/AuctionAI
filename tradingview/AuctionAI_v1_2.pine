@@ -1,0 +1,657 @@
+//@version=6
+indicator("AuctionAI v1.2 - Weight Recommendation & Evidence Ranking", overlay=true, max_bars_back=5000)
+
+// v1.2 — Weight Recommendation & Evidence Ranking Engine
+// Research / recommendation only.
+// Frozen decision weights are NEVER modified by this script.
+// No entry, SL, TP, position sizing, execution, auto-learning, or threshold adaptation.
+// Outcome is normalized price behavior after a decision reference, not P&L.
+
+// ========================= INPUTS =========================
+validationHorizon = input.int(5, "Validation Horizon", minval=1)
+h1Bars = input.int(1, "H1 Bars", minval=1)
+h3Bars = input.int(3, "H3 Bars", minval=1)
+h5Bars = input.int(5, "H5 Bars", minval=1)
+h10Bars = input.int(10, "H10 Bars", minval=1)
+h20Bars = input.int(20, "H20 Bars", minval=1)
+favorableThresholdAtr = input.float(0.50, "Favorable Threshold (ATR)", minval=0.0, step=0.05)
+archiveLimit = input.int(300, "Outcome Archive Size", minval=50, maxval=500)
+minResearchSamples = input.int(20, "Research Minimum Samples", minval=2, maxval=500)
+recommendationMinSamples = input.int(50, "Recommendation Minimum Samples", minval=20, maxval=500)
+evaluationPercent = input.int(30, "Evaluation Sample %", minval=10, maxval=50)
+maxWeightDelta = input.int(1, "Maximum Recommendation Change", minval=1, maxval=3)
+
+// Frozen decision-engine weights. v1.2 only recommends alternatives.
+weightDelta = input.int(2, "Current Delta Weight", minval=-10, maxval=10)
+weightCvd = input.int(2, "Current CVD Weight", minval=-10, maxval=10)
+weightEffort = input.int(1, "Current Effort Weight", minval=-10, maxval=10)
+weightResult = input.int(1, "Current Result Weight", minval=-10, maxval=10)
+weightBody = input.int(1, "Current Strong Body Weight", minval=-10, maxval=10)
+weightBreakout = input.int(2, "Current Breakout Weight", minval=-10, maxval=10)
+weightAbsorption = input.int(-3, "Current Absorption Weight", minval=-10, maxval=10)
+
+// ========================= MARKET PROXIES =========================
+atr = ta.atr(14)
+atrSafe = math.max(nz(atr, syminfo.mintick), syminfo.mintick)
+barRange = high - low
+body = close - open
+volumeAvg = ta.sma(volume, 20)
+volumeSafe = math.max(nz(volumeAvg, volume), 1.0)
+
+deltaProxy = body / atrSafe
+cvdProxy = ta.ema(deltaProxy, 5)
+effortRatio = volume / volumeSafe
+resultRatio = math.abs(body) / atrSafe
+absorptionProxy = effortRatio > 1.5 and resultRatio < 0.35
+contextState = math.abs(close - nz(close[10], close)) / atrSafe > 1.5 ? "TREND" : "RANGE"
+
+deltaAligned = body != 0
+cvdAligned = (body > 0 and cvdProxy > 0) or (body < 0 and cvdProxy < 0)
+effortAligned = effortRatio >= 1.0
+resultAligned = body != 0 and resultRatio >= 0.5
+
+// ========================= DECISION REFERENCE =========================
+// Standalone compatibility layer. A new research record starts only when
+// the previous outcome has completed its archive horizon.
+strongLong = close > open and barRange > atrSafe * 0.75
+strongShort = close < open and barRange > atrSafe * 0.75
+candidateDirection = strongLong ? 1 : strongShort ? -1 : 0
+
+var int nextSetupId = 0
+var int decisionDirection = 0
+var string decisionState = "WAIT"
+var string decisionQuality = "LOW"
+var string decisionConfidence = "LOW"
+var string decisionHealth = "HEALTHY"
+
+// ========================= OUTCOME ARCHIVE =========================
+var array<int> aSetup = array.new_int()
+var array<int> aDir = array.new_int()
+var array<string> aDecision = array.new_string()
+var array<string> aQuality = array.new_string()
+var array<string> aConfidence = array.new_string()
+var array<string> aHealth = array.new_string()
+var array<string> aContext = array.new_string()
+var array<bool> aDelta = array.new_bool()
+var array<bool> aCvd = array.new_bool()
+var array<bool> aEffort = array.new_bool()
+var array<bool> aResult = array.new_bool()
+var array<bool> aNoAbsorption = array.new_bool()
+var array<bool> aRetestHold = array.new_bool()
+var array<float> aH1 = array.new_float()
+var array<float> aH3 = array.new_float()
+var array<float> aH5 = array.new_float()
+var array<float> aH10 = array.new_float()
+var array<float> aH20 = array.new_float()
+var array<float> aMfe = array.new_float()
+var array<float> aMae = array.new_float()
+var array<string> aValidation = array.new_string()
+var array<string> aTiming = array.new_string()
+
+// ========================= ACTIVE OUTCOME =========================
+var bool outcomeActive = false
+var int outcomeSetupId = 0
+var int outcomeDirection = 0
+var int outcomeStartBar = na
+var float outcomeReference = na
+var float outcomeMfe = 0.0
+var float outcomeMae = 0.0
+var float outcomeAtr = na
+var float outcomeH1 = na
+var float outcomeH3 = na
+var float outcomeH5 = na
+var float outcomeH10 = na
+var float outcomeH20 = na
+var bool outcomeH1Done = false
+var bool outcomeH3Done = false
+var bool outcomeH5Done = false
+var bool outcomeH10Done = false
+var bool outcomeH20Done = false
+var string outcomeValidation = "PENDING"
+var string outcomeTiming = "PENDING"
+var string outcomeQuality = "LOW"
+var string outcomeConfidence = "LOW"
+var string outcomeHealth = "HEALTHY"
+var string outcomeContext = "RANGE"
+var bool outcomeDelta = false
+var bool outcomeCvd = false
+var bool outcomeEffort = false
+var bool outcomeResult = false
+var bool outcomeNoAbsorption = true
+
+newDecision = not outcomeActive and candidateDirection != 0
+if newDecision
+    nextSetupId += 1
+    decisionDirection := candidateDirection
+    decisionState := decisionDirection > 0 ? "LONG BIAS" : "SHORT BIAS"
+    decisionQuality := barRange > atrSafe ? "HIGH" : "MEDIUM"
+    decisionConfidence := barRange > atrSafe * 1.25 ? "HIGH" : "MEDIUM"
+    decisionHealth := "HEALTHY"
+
+    outcomeActive := true
+    outcomeSetupId := nextSetupId
+    outcomeDirection := decisionDirection
+    outcomeStartBar := bar_index
+    outcomeReference := close
+    outcomeMfe := 0.0
+    outcomeMae := 0.0
+    outcomeAtr := atrSafe
+    outcomeH1 := na
+    outcomeH3 := na
+    outcomeH5 := na
+    outcomeH10 := na
+    outcomeH20 := na
+    outcomeH1Done := false
+    outcomeH3Done := false
+    outcomeH5Done := false
+    outcomeH10Done := false
+    outcomeH20Done := false
+    outcomeValidation := "PENDING"
+    outcomeTiming := "PENDING"
+    outcomeQuality := decisionQuality
+    outcomeConfidence := decisionConfidence
+    outcomeHealth := decisionHealth
+    outcomeContext := contextState
+    outcomeDelta := deltaAligned
+    outcomeCvd := cvdAligned
+    outcomeEffort := effortAligned
+    outcomeResult := resultAligned
+    outcomeNoAbsorption := not absorptionProxy
+
+// ========================= UPDATE / ARCHIVE =========================
+if outcomeActive
+    signedHigh = outcomeDirection > 0 ? high - outcomeReference : outcomeReference - low
+    signedLow = outcomeDirection > 0 ? low - outcomeReference : outcomeReference - high
+    outcomeMfe := math.max(outcomeMfe, signedHigh)
+    outcomeMae := math.min(outcomeMae, signedLow)
+
+    barsElapsed = bar_index - outcomeStartBar
+    currentMoveAtr = (close - outcomeReference) / outcomeAtr * outcomeDirection
+
+    if not outcomeH1Done and barsElapsed >= h1Bars
+        outcomeH1 := currentMoveAtr
+        outcomeH1Done := true
+    if not outcomeH3Done and barsElapsed >= h3Bars
+        outcomeH3 := currentMoveAtr
+        outcomeH3Done := true
+    if not outcomeH5Done and barsElapsed >= h5Bars
+        outcomeH5 := currentMoveAtr
+        outcomeH5Done := true
+    if not outcomeH10Done and barsElapsed >= h10Bars
+        outcomeH10 := currentMoveAtr
+        outcomeH10Done := true
+    if not outcomeH20Done and barsElapsed >= h20Bars
+        outcomeH20 := currentMoveAtr
+        outcomeH20Done := true
+
+    if outcomeValidation == "PENDING" and barsElapsed >= validationHorizon
+        outcomeValidation := currentMoveAtr >= favorableThresholdAtr ? "VALIDATED" : currentMoveAtr <= -favorableThresholdAtr ? "FAILED" : "NEUTRAL"
+        outcomeTiming := outcomeValidation == "VALIDATED" ? (barsElapsed <= h3Bars ? "FAST" : "NORMAL") : outcomeValidation == "FAILED" ? "FAILED" : "NORMAL"
+
+    archiveHorizon = math.max(math.max(math.max(math.max(h1Bars, h3Bars), h5Bars), h10Bars), h20Bars)
+    shouldArchive = barsElapsed >= archiveHorizon and outcomeValidation != "PENDING"
+
+    if shouldArchive
+        array.push(aSetup, outcomeSetupId)
+        array.push(aDir, outcomeDirection)
+        array.push(aDecision, outcomeDirection > 0 ? "LONG BIAS" : "SHORT BIAS")
+        array.push(aQuality, outcomeQuality)
+        array.push(aConfidence, outcomeConfidence)
+        array.push(aHealth, outcomeHealth)
+        array.push(aContext, outcomeContext)
+        array.push(aDelta, outcomeDelta)
+        array.push(aCvd, outcomeCvd)
+        array.push(aEffort, outcomeEffort)
+        array.push(aResult, outcomeResult)
+        array.push(aNoAbsorption, outcomeNoAbsorption)
+        array.push(aRetestHold, na(outcomeH3) ? false : outcomeH3 > -0.25)
+        array.push(aH1, outcomeH1)
+        array.push(aH3, outcomeH3)
+        array.push(aH5, outcomeH5)
+        array.push(aH10, outcomeH10)
+        array.push(aH20, outcomeH20)
+        array.push(aMfe, outcomeMfe / outcomeAtr)
+        array.push(aMae, outcomeMae / outcomeAtr)
+        array.push(aValidation, outcomeValidation)
+        array.push(aTiming, outcomeTiming)
+
+        while array.size(aSetup) > archiveLimit
+            array.shift(aSetup)
+            array.shift(aDir)
+            array.shift(aDecision)
+            array.shift(aQuality)
+            array.shift(aConfidence)
+            array.shift(aHealth)
+            array.shift(aContext)
+            array.shift(aDelta)
+            array.shift(aCvd)
+            array.shift(aEffort)
+            array.shift(aResult)
+            array.shift(aNoAbsorption)
+            array.shift(aRetestHold)
+            array.shift(aH1)
+            array.shift(aH3)
+            array.shift(aH5)
+            array.shift(aH10)
+            array.shift(aMfe)
+            array.shift(aMae)
+            array.shift(aValidation)
+            array.shift(aTiming)
+        outcomeActive := false
+
+// ========================= HELPERS =========================
+rate(_wins, _count) => _count > 0 ? _wins * 100.0 / _count : na
+lift(_rate, _baseline) => not na(_rate) and not na(_baseline) ? _rate - _baseline : na
+fmtPct(_x) => na(_x) ? "-" : str.tostring(_x, "#.0") + "%"
+fmtLift(_x) => na(_x) ? "-" : (_x >= 0 ? "+" : "") + str.tostring(_x, "#.0") + " pp"
+
+// Recommendation logic is deliberately conservative.
+// It requires sample strength, positive research evidence, stable directional effect,
+// and an out-of-sample check before proposing +1. Negative evidence can propose -1.
+recommendation(_count, _researchRate, _researchBaseline, _evalRate, _evalBaseline, _r1, _r2, _r3, _currentWeight, _isNegative) =>
+    researchLift = lift(_researchRate, _researchBaseline)
+    evalLift = lift(_evalRate, _evalBaseline)
+    minPeriodRate = math.min(_r1, math.min(_r2, _r3))
+    maxPeriodRate = math.max(_r1, math.max(_r2, _r3))
+    stable = not na(_r1) and not na(_r2) and not na(_r3) and maxPeriodRate - minPeriodRate <= 15
+    enough = _count >= recommendationMinSamples
+    oosPass = not na(evalLift) and evalLift >= 3
+    strongEvidence = enough and not na(researchLift) and math.abs(researchLift) >= 8 and stable and oosPass
+    moderateEvidence = enough and not na(researchLift) and math.abs(researchLift) >= 5 and stable and not na(evalLift) and evalLift >= 0
+    dir = _isNegative ? (strongEvidence and researchLift < 0 ? -maxWeightDelta : moderateEvidence and researchLift < 0 ? -1 : 0) : (strongEvidence and researchLift > 0 ? maxWeightDelta : moderateEvidence and researchLift > 0 ? 1 : 0)
+    dir := math.max(-maxWeightDelta, math.min(maxWeightDelta, dir))
+    rec = _currentWeight + dir
+    strength = strongEvidence ? "STRONG" : moderateEvidence ? "MODERATE" : enough ? "WEAK" : "INSUFFICIENT"
+    status = strongEvidence ? "PASS" : moderateEvidence ? "CANDIDATE" : "HOLD"
+    [rec, dir, strength, status, researchLift, evalLift, stable]
+
+// ========================= DATASET SPLIT =========================
+N = array.size(aSetup)
+evalCount = int(math.floor(N * evaluationPercent / 100.0))
+researchCount = N - evalCount
+
+evalBaseN = 0
+evalBaseW = 0
+researchBaseN = 0
+researchBaseW = 0
+
+// Research buckets for each evidence.
+dTN = 0
+dTW = 0
+cTN = 0
+cTW = 0
+eTN = 0
+eTW = 0
+rTN = 0
+rTW = 0
+absN = 0
+absW = 0
+
+// Direction-conditioned buckets.
+dLongN = 0
+dLongW = 0
+dShortN = 0
+dShortW = 0
+cLongN = 0
+cLongW = 0
+cShortN = 0
+cShortW = 0
+
+// Context-conditioned buckets.
+cTrendN = 0
+cTrendW = 0
+cRangeN = 0
+cRangeW = 0
+
+// Retest-conditioned buckets.
+cHoldN = 0
+cHoldW = 0
+cWeakN = 0
+cWeakW = 0
+
+// Interactions.
+dcN = 0
+dcW = 0
+
+// Stability buckets: chronological thirds of research sample.
+dR1N = 0
+dR1W = 0
+dR2N = 0
+dR2W = 0
+dR3N = 0
+dR3W = 0
+
+if N > 0
+    for i = 0 to N - 1
+        v = array.get(aValidation, i)
+        win = v == "VALIDATED"
+        if i < researchCount
+            researchBaseN += 1
+            researchBaseW += win ? 1 : 0
+            d = array.get(aDelta, i)
+            c = array.get(aCvd, i)
+            e = array.get(aEffort, i)
+            r = array.get(aResult, i)
+            noAbs = array.get(aNoAbsorption, i)
+            hold = array.get(aRetestHold, i)
+            dir = array.get(aDir, i)
+            ctx = array.get(aContext, i)
+
+            dTN += d ? 1 : 0
+            dTW += d and win ? 1 : 0
+            cTN += c ? 1 : 0
+            cTW += c and win ? 1 : 0
+            eTN += e ? 1 : 0
+            eTW += e and win ? 1 : 0
+            rTN += r ? 1 : 0
+            rTW += r and win ? 1 : 0
+            absN += not noAbs ? 1 : 0
+            absW += not noAbs and win ? 1 : 0
+
+            dLongN += d and dir > 0 ? 1 : 0
+            dLongW += d and dir > 0 and win ? 1 : 0
+            dShortN += d and dir < 0 ? 1 : 0
+            dShortW += d and dir < 0 and win ? 1 : 0
+            cLongN += c and dir > 0 ? 1 : 0
+            cLongW += c and dir > 0 and win ? 1 : 0
+            cShortN += c and dir < 0 ? 1 : 0
+            cShortW += c and dir < 0 and win ? 1 : 0
+
+            cTrendN += c and ctx == "TREND" ? 1 : 0
+            cTrendW += c and ctx == "TREND" and win ? 1 : 0
+            cRangeN += c and ctx == "RANGE" ? 1 : 0
+            cRangeW += c and ctx == "RANGE" and win ? 1 : 0
+
+            cHoldN += c and hold ? 1 : 0
+            cHoldW += c and hold and win ? 1 : 0
+            cWeakN += c and not hold ? 1 : 0
+            cWeakW += c and not hold and win ? 1 : 0
+
+            dc = d and c
+            dcN += dc ? 1 : 0
+            dcW += dc and win ? 1 : 0
+
+            third = researchCount > 0 ? int(math.floor(i * 3.0 / researchCount)) : 0
+            if third <= 0
+                dR1N += d ? 1 : 0
+                dR1W += d and win ? 1 : 0
+            else if third == 1
+                dR2N += d ? 1 : 0
+                dR2W += d and win ? 1 : 0
+            else
+                dR3N += d ? 1 : 0
+                dR3W += d and win ? 1 : 0
+        else
+            evalBaseN += 1
+            evalBaseW += win ? 1 : 0
+
+researchBaseline = rate(researchBaseW, researchBaseN)
+evalBaseline = rate(evalBaseW, evalBaseN)
+
+dRate = rate(dTW, dTN)
+cRate = rate(cTW, cTN)
+eRate = rate(eTW, eTN)
+rRate = rate(rTW, rTN)
+absRate = rate(absW, absN)
+
+dLongRate = rate(dLongW, dLongN)
+dShortRate = rate(dShortW, dShortN)
+cLongRate = rate(cLongW, cLongN)
+cShortRate = rate(cShortW, cShortN)
+cTrendRate = rate(cTrendW, cTrendN)
+cRangeRate = rate(cRangeW, cRangeN)
+cHoldRate = rate(cHoldW, cHoldN)
+cWeakRate = rate(cWeakW, cWeakN)
+dcRate = rate(dcW, dcN)
+
+dR1Rate = rate(dR1W, dR1N)
+dR2Rate = rate(dR2W, dR2N)
+dR3Rate = rate(dR3W, dR3N)
+
+// OOS bucket calculation for evidence, direction, context, and retest.
+evalDTN = 0
+evalDTW = 0
+evalCN = 0
+evalCW = 0
+evalAbsN = 0
+evalAbsW = 0
+evalCLongN = 0
+evalCLongW = 0
+evalCTrendN = 0
+evalCTrendW = 0
+evalCHoldN = 0
+evalCHoldW = 0
+if N > 0 and evalCount > 0
+    for i = researchCount to N - 1
+        v = array.get(aValidation, i)
+        win = v == "VALIDATED"
+        d = array.get(aDelta, i)
+        c = array.get(aCvd, i)
+        noAbs = array.get(aNoAbsorption, i)
+        hold = array.get(aRetestHold, i)
+        dir = array.get(aDir, i)
+        ctx = array.get(aContext, i)
+        evalDTN += d ? 1 : 0
+        evalDTW += d and win ? 1 : 0
+        evalCN += c ? 1 : 0
+        evalCW += c and win ? 1 : 0
+        evalAbsN += not noAbs ? 1 : 0
+        evalAbsW += not noAbs and win ? 1 : 0
+        evalCLongN += c and dir > 0 ? 1 : 0
+        evalCLongW += c and dir > 0 and win ? 1 : 0
+        evalCTrendN += c and ctx == "TREND" ? 1 : 0
+        evalCTrendW += c and ctx == "TREND" and win ? 1 : 0
+        evalCHoldN += c and hold ? 1 : 0
+        evalCHoldW += c and hold and win ? 1 : 0
+
+evalDRate = rate(evalDTW, evalDTN)
+evalCRate = rate(evalCW, evalCN)
+evalAbsRate = rate(evalAbsW, evalAbsN)
+evalCLongRate = rate(evalCLongW, evalCLongN)
+evalCTrendRate = rate(evalCTrendW, evalCTrendN)
+evalCHoldRate = rate(evalCHoldW, evalCHoldN)
+
+// ========================= RECOMMENDATIONS =========================
+[dRec, dDelta, dStrength, dStatus, dResearchLift, dOosLift, dStable] = recommendation(dTN, dRate, researchBaseline, evalDRate, evalBaseline, dR1Rate, dR2Rate, dR3Rate, weightDelta, false)
+[cRec, cDelta, cStrength, cStatus, cResearchLift, cOosLift, cStable] = recommendation(cTN, cRate, researchBaseline, evalCRate, evalBaseline, cRate, cRate, cRate, weightCvd, false)
+[eRec, eDelta, eStrength, eStatus, eResearchLift, eOosLift, eStable] = recommendation(eTN, eRate, researchBaseline, na, evalBaseline, eRate, eRate, eRate, weightEffort, false)
+[rRec, rDelta, rStrength, rStatus, rResearchLift, rOosLift, rStable] = recommendation(rTN, rRate, researchBaseline, na, evalBaseline, rRate, rRate, rRate, weightResult, false)
+[aRec, aDelta, aStrength, aStatus, aResearchLift, aOosLift, aStable] = recommendation(absN, absRate, researchBaseline, evalAbsRate, evalBaseline, absRate, absRate, absRate, weightAbsorption, true)
+
+// Direction/context/retest recommendations are research diagnostics, not weight changes.
+cLongLift = lift(cLongRate, researchBaseline)
+cShortLift = lift(cShortRate, researchBaseline)
+cTrendLift = lift(cTrendRate, researchBaseline)
+cRangeLift = lift(cRangeRate, researchBaseline)
+cHoldLift = lift(cHoldRate, researchBaseline)
+cWeakLift = lift(cWeakRate, researchBaseline)
+interactionLift = lift(dcRate, researchBaseline)
+
+cLongOosLift = lift(evalCLongRate, evalBaseline)
+cTrendOosLift = lift(evalCTrendRate, evalBaseline)
+cHoldOosLift = lift(evalCHoldRate, evalBaseline)
+
+contextStatus(_n, _lift, _oos) => _n < recommendationMinSamples ? "INSUFFICIENT" : not na(_lift) and _lift >= 8 and not na(_oos) and _oos >= 3 ? "HIGH" : not na(_lift) and _lift >= 5 ? "MEDIUM" : "LOW"
+
+cLongStatus = contextStatus(cLongN, cLongLift, cLongOosLift)
+cShortStatus = contextStatus(cShortN, cShortLift, na)
+cTrendStatus = contextStatus(cTrendN, cTrendLift, cTrendOosLift)
+cRangeStatus = contextStatus(cRangeN, cRangeLift, na)
+cHoldStatus = contextStatus(cHoldN, cHoldLift, cHoldOosLift)
+cWeakStatus = contextStatus(cWeakN, cWeakLift, na)
+interactionStatus = dcN < recommendationMinSamples ? "INSUFFICIENT" : not na(interactionLift) and interactionLift >= 10 ? "STRONG" : not na(interactionLift) and interactionLift >= 5 ? "MODERATE" : "HOLD"
+
+// ========================= HUD =========================
+var table hud = table.new(position.top_right, 6, 24)
+
+if barstate.islast
+    table.clear(hud, 0, 0, 5, 23)
+    table.cell(hud, 0, 0, "AUCTION AI v1.2")
+    table.cell(hud, 1, 0, "WEIGHT RESEARCH")
+    table.cell(hud, 2, 0, "N=" + str.tostring(N))
+    table.cell(hud, 3, 0, "REC MIN=" + str.tostring(recommendationMinSamples))
+    table.cell(hud, 4, 0, "Δ MAX=±" + str.tostring(maxWeightDelta))
+    table.cell(hud, 5, 0, "FROZEN")
+
+    table.cell(hud, 0, 1, "EVIDENCE")
+    table.cell(hud, 1, 1, "NOW")
+    table.cell(hud, 2, 1, "REC")
+    table.cell(hud, 3, 1, "Δ")
+    table.cell(hud, 4, 1, "STRENGTH")
+    table.cell(hud, 5, 1, "STATUS")
+
+    table.cell(hud, 0, 2, "DELTA")
+    table.cell(hud, 1, 2, str.tostring(weightDelta))
+    table.cell(hud, 2, 2, str.tostring(dRec))
+    table.cell(hud, 3, 2, str.tostring(dDelta))
+    table.cell(hud, 4, 2, dStrength)
+    table.cell(hud, 5, 2, dStatus)
+
+    table.cell(hud, 0, 3, "CVD")
+    table.cell(hud, 1, 3, str.tostring(weightCvd))
+    table.cell(hud, 2, 3, str.tostring(cRec))
+    table.cell(hud, 3, 3, str.tostring(cDelta))
+    table.cell(hud, 4, 3, cStrength)
+    table.cell(hud, 5, 3, cStatus)
+
+    table.cell(hud, 0, 4, "EFFORT")
+    table.cell(hud, 1, 4, str.tostring(weightEffort))
+    table.cell(hud, 2, 4, str.tostring(eRec))
+    table.cell(hud, 3, 4, str.tostring(eDelta))
+    table.cell(hud, 4, 4, eStrength)
+    table.cell(hud, 5, 4, eStatus)
+
+    table.cell(hud, 0, 5, "RESULT")
+    table.cell(hud, 1, 5, str.tostring(weightResult))
+    table.cell(hud, 2, 5, str.tostring(rRec))
+    table.cell(hud, 3, 5, str.tostring(rDelta))
+    table.cell(hud, 4, 5, rStrength)
+    table.cell(hud, 5, 5, rStatus)
+
+    table.cell(hud, 0, 6, "ABSORPTION")
+    table.cell(hud, 1, 6, str.tostring(weightAbsorption))
+    table.cell(hud, 2, 6, str.tostring(aRec))
+    table.cell(hud, 3, 6, str.tostring(aDelta))
+    table.cell(hud, 4, 6, aStrength)
+    table.cell(hud, 5, 6, aStatus)
+
+    table.cell(hud, 0, 7, "BASELINE")
+    table.cell(hud, 1, 7, fmtPct(researchBaseline))
+    table.cell(hud, 2, 7, "OOS")
+    table.cell(hud, 3, 7, fmtPct(evalBaseline))
+    table.cell(hud, 4, 7, "Research")
+    table.cell(hud, 5, 7, str.tostring(researchCount))
+
+    table.cell(hud, 0, 8, "CVD LONG")
+    table.cell(hud, 1, 8, str.tostring(cLongN))
+    table.cell(hud, 2, 8, fmtLift(cLongLift))
+    table.cell(hud, 3, 8, cLongStatus)
+    table.cell(hud, 4, 8, "HIGH relevance")
+    table.cell(hud, 5, 8, "DIR")
+
+    table.cell(hud, 0, 9, "CVD SHORT")
+    table.cell(hud, 1, 9, str.tostring(cShortN))
+    table.cell(hud, 2, 9, fmtLift(cShortLift))
+    table.cell(hud, 3, 9, cShortStatus)
+    table.cell(hud, 4, 9, "Direction")
+    table.cell(hud, 5, 9, "RESEARCH")
+
+    table.cell(hud, 0, 10, "CVD TREND")
+    table.cell(hud, 1, 10, str.tostring(cTrendN))
+    table.cell(hud, 2, 10, fmtLift(cTrendLift))
+    table.cell(hud, 3, 10, cTrendStatus)
+    table.cell(hud, 4, 10, "Context")
+    table.cell(hud, 5, 10, "TREND")
+
+    table.cell(hud, 0, 11, "CVD RANGE")
+    table.cell(hud, 1, 11, str.tostring(cRangeN))
+    table.cell(hud, 2, 11, fmtLift(cRangeLift))
+    table.cell(hud, 3, 11, cRangeStatus)
+    table.cell(hud, 4, 11, "Context")
+    table.cell(hud, 5, 11, "RANGE")
+
+    table.cell(hud, 0, 12, "CVD + HOLD")
+    table.cell(hud, 1, 12, str.tostring(cHoldN))
+    table.cell(hud, 2, 12, fmtLift(cHoldLift))
+    table.cell(hud, 3, 12, cHoldStatus)
+    table.cell(hud, 4, 12, "Retest")
+    table.cell(hud, 5, 12, "HOLD")
+
+    table.cell(hud, 0, 13, "CVD + WEAK")
+    table.cell(hud, 1, 13, str.tostring(cWeakN))
+    table.cell(hud, 2, 13, fmtLift(cWeakLift))
+    table.cell(hud, 3, 13, cWeakStatus)
+    table.cell(hud, 4, 13, "Retest")
+    table.cell(hud, 5, 13, "WEAK")
+
+    table.cell(hud, 0, 14, "DELTA × CVD")
+    table.cell(hud, 1, 14, str.tostring(dcN))
+    table.cell(hud, 2, 14, fmtLift(interactionLift))
+    table.cell(hud, 3, 14, interactionStatus)
+    table.cell(hud, 4, 14, "INTERACTION")
+    table.cell(hud, 5, 14, "RESEARCH")
+
+    table.cell(hud, 0, 15, "OOS CVD")
+    table.cell(hud, 1, 15, fmtPct(evalCRate))
+    table.cell(hud, 2, 15, fmtLift(cOosLift))
+    table.cell(hud, 3, 15, cOosLift >= 3 ? "PASS" : "FAIL/HOLD")
+    table.cell(hud, 4, 15, "OUT-OF-SAMPLE")
+    table.cell(hud, 5, 15, str.tostring(evalCN))
+
+    table.cell(hud, 0, 16, "OOS ABS")
+    table.cell(hud, 1, 16, fmtPct(evalAbsRate))
+    table.cell(hud, 2, 16, fmtLift(lift(evalAbsRate, evalBaseline)))
+    table.cell(hud, 3, 16, "VALIDATION")
+    table.cell(hud, 4, 16, "NEGATIVE")
+    table.cell(hud, 5, 16, str.tostring(evalAbsN))
+
+    table.cell(hud, 0, 17, "DELTA STABILITY")
+    table.cell(hud, 1, 17, fmtPct(dR1Rate))
+    table.cell(hud, 2, 17, fmtPct(dR2Rate))
+    table.cell(hud, 3, 17, fmtPct(dR3Rate))
+    table.cell(hud, 4, 17, dStable ? "HIGH" : "LOW")
+    table.cell(hud, 5, 17, "3 PERIODS")
+
+    table.cell(hud, 0, 18, "RECOMMENDATION")
+    table.cell(hud, 1, 18, "RESEARCH ONLY")
+    table.cell(hud, 2, 18, "HUMAN REVIEW")
+    table.cell(hud, 3, 18, "NO AUTO APPLY")
+    table.cell(hud, 4, 18, "NO THRESHOLD")
+    table.cell(hud, 5, 18, "NO EXECUTION")
+
+    table.cell(hud, 0, 19, "REASON CVD")
+    table.cell(hud, 1, 19, cStatus)
+    table.cell(hud, 2, 19, "Lift " + fmtLift(cResearchLift))
+    table.cell(hud, 3, 19, "OOS " + fmtLift(cOosLift))
+    table.cell(hud, 4, 19, cStable ? "STABLE" : "UNSTABLE")
+    table.cell(hud, 5, 19, str.tostring(cTN) + " samples")
+
+    table.cell(hud, 0, 20, "REASON ABS")
+    table.cell(hud, 1, 20, aStatus)
+    table.cell(hud, 2, 20, "Lift " + fmtLift(aResearchLift))
+    table.cell(hud, 3, 20, "OOS " + fmtLift(aOosLift))
+    table.cell(hud, 4, 20, aStable ? "STABLE" : "UNSTABLE")
+    table.cell(hud, 5, 20, str.tostring(absN) + " samples")
+
+    table.cell(hud, 0, 21, "SETUP")
+    table.cell(hud, 1, 21, outcomeActive ? "TRACKING #" + str.tostring(outcomeSetupId) : "IDLE")
+    table.cell(hud, 2, 21, outcomeValidation)
+    table.cell(hud, 3, 21, decisionState)
+    table.cell(hud, 4, 21, decisionQuality)
+    table.cell(hud, 5, 21, decisionConfidence)
+
+    table.cell(hud, 0, 22, "GUARD")
+    table.cell(hud, 1, 22, "WEIGHTS FROZEN")
+    table.cell(hud, 2, 22, "Δ≤±" + str.tostring(maxWeightDelta))
+    table.cell(hud, 3, 22, "MIN=" + str.tostring(minResearchSamples))
+    table.cell(hud, 4, 22, "REC MIN=" + str.tostring(recommendationMinSamples))
+    table.cell(hud, 5, 22, "OOS=" + str.tostring(evaluationPercent) + "%")
+
+    table.cell(hud, 0, 23, "VERSION")
+    table.cell(hud, 1, 23, "v1.2")
+    table.cell(hud, 2, 23, "Weight Recommendation")
+    table.cell(hud, 3, 23, "Audit")
+    table.cell(hud, 4, 23, "Research")
+    table.cell(hud, 5, 23, "SAFE")
+
+plot(outcomeActive ? outcomeReference : na, "Decision Reference", color=color.new(color.gray, 0), linewidth=1, style=plot.style_linebr)
