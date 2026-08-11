@@ -246,9 +246,9 @@ fmtPct(_x) => na(_x) ? "-" : str.tostring(_x, "#.0") + "%"
 fmtLift(_x) => na(_x) ? "-" : (_x >= 0 ? "+" : "") + str.tostring(_x, "#.0") + " pp"
 
 // Recommendation logic is deliberately conservative.
-// It requires sample strength, positive research evidence, stable directional effect,
-// and an out-of-sample check before proposing +1. Negative evidence can propose -1.
-recommendation(_count, _researchRate, _researchBaseline, _evalRate, _evalBaseline, _r1, _r2, _r3, _currentWeight, _isNegative) =>
+// Explicit float typing on evaluation arguments allows intentional na values
+// for evidence buckets that do not yet have a valid OOS calculation.
+recommendation(_count, _researchRate, _researchBaseline, float _evalRate, float _evalBaseline, _r1, _r2, _r3, _currentWeight, _isNegative) =>
     researchLift = lift(_researchRate, _researchBaseline)
     evalLift = lift(_evalRate, _evalBaseline)
     minPeriodRate = math.min(_r1, math.min(_r2, _r3))
@@ -454,8 +454,8 @@ evalCHoldRate = rate(evalCHoldW, evalCHoldN)
 // ========================= RECOMMENDATIONS =========================
 [dRec, dDelta, dStrength, dStatus, dResearchLift, dOosLift, dStable] = recommendation(dTN, dRate, researchBaseline, evalDRate, evalBaseline, dR1Rate, dR2Rate, dR3Rate, weightDelta, false)
 [cRec, cDelta, cStrength, cStatus, cResearchLift, cOosLift, cStable] = recommendation(cTN, cRate, researchBaseline, evalCRate, evalBaseline, cRate, cRate, cRate, weightCvd, false)
-[eRec, eDelta, eStrength, eStatus, eResearchLift, eOosLift, eStable] = recommendation(eTN, eRate, researchBaseline, na, evalBaseline, eRate, eRate, eRate, weightEffort, false)
-[rRec, rDelta, rStrength, rStatus, rResearchLift, rOosLift, rStable] = recommendation(rTN, rRate, researchBaseline, na, evalBaseline, rRate, rRate, rRate, weightResult, false)
+[eRec, eDelta, eStrength, eStatus, eResearchLift, eOosLift, eStable] = recommendation(eTN, eRate, researchBaseline, float(na), evalBaseline, eRate, eRate, eRate, weightEffort, false)
+[rRec, rDelta, rStrength, rStatus, rResearchLift, rOosLift, rStable] = recommendation(rTN, rRate, researchBaseline, float(na), evalBaseline, rRate, rRate, rRate, weightResult, false)
 [aRec, aDelta, aStrength, aStatus, aResearchLift, aOosLift, aStable] = recommendation(absN, absRate, researchBaseline, evalAbsRate, evalBaseline, absRate, absRate, absRate, weightAbsorption, true)
 
 // Direction/context/retest recommendations are research diagnostics, not weight changes.
