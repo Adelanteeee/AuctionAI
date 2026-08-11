@@ -3,8 +3,285 @@ indicator("AuctionAI v0.9 - Outcome Tracking & Decision Validation", overlay=tru
 
 // v0.9 — Outcome Tracking, Validation & Outcome Archive
 // Extends v0.8 with decision-to-outcome tracking, configurable horizons,
-// MFE/MAE, timing quality, validation, and persistent outcome archive.
+// MFE/MAE, outcome classification, timing quality and validation.
+// Outcome is price behavior after a Decision Snapshot — NOT a trade, P&L,
+// entry, execution, prediction, ML or self-learning.
+// Acceptance Score remains Evidence Quality Only.
 
-// This file was supplied as the corrected v0.9 archive version.
+// ---------- INPUTS ----------
+validationHorizon = input.int(5, "Validation Horizon", minval=1)
+h1Bars = input.int(1, "H1 Bars", minval=1)
+h3Bars = input.int(3, "H3 Bars", minval=1)
+h5Bars = input.int(5, "H5 Bars", minval=1)
+h10Bars = input.int(10, "H10 Bars", minval=1)
+h20Bars = input.int(20, "H20 Bars", minval=1)
+favorableThresholdAtr = input.float(0.50, "Favorable Threshold (ATR)", minval=0.0, step=0.05)
+neutralThresholdAtr = input.float(0.10, "Neutral Threshold (ATR)", minval=0.0, step=0.05)
+slowValidationBars = input.int(10, "Slow Validation Bars", minval=1)
+archiveLimit = input.int(100, "Outcome Archive Size", minval=1, maxval=500)
 
-// NOTE: Full source is intentionally preserved exactly as supplied.
+// ---------- BASIC MARKET PROXIES ----------
+atr = ta.atr(14)
+barRange = high - low
+
+// ---------- DECISION INPUTS / COMPATIBILITY LAYER ----------
+// These are intentionally conservative fallbacks so v0.9 can operate as a standalone
+// validation layer. If an upstream AuctionAI engine is present, replace these values
+// with its Decision Snapshot outputs.
+var int decisionDirection = 0
+var string decisionState = "WAIT"
+var string decisionQuality = "LOW"
+var string decisionConfidence = "LOW"
+var string decisionHealth = "HEALTHY"
+var int setupId = 0
+
+// Simple event proxy: directional close displacement beyond a fraction of ATR.
+longDecision = close > open and barRange > atr * 0.75
+shortDecision = close < open and barRange > atr * 0.75
+newDecision = longDecision or shortDecision
+
+if newDecision
+    setupId += 1
+    decisionDirection := longDecision ? 1 : -1
+    decisionState := longDecision ? "LONG BIAS" : "SHORT BIAS"
+    decisionQuality := barRange > atr ? "HIGH" : "MEDIUM"
+    decisionConfidence := barRange > atr * 1.25 ? "HIGH" : "MEDIUM"
+    decisionHealth := "HEALTHY"
+
+// ---------- OUTCOME ARCHIVE ----------
+var array<int> archivedSetupId = array.new_int()
+var array<int> archivedDirection = array.new_int()
+var array<string> archivedDecision = array.new_string()
+var array<string> archivedQuality = array.new_string()
+var array<string> archivedConfidence = array.new_string()
+var array<string> archivedHealth = array.new_string()
+var array<float> archivedH1 = array.new_float()
+var array<float> archivedH3 = array.new_float()
+var array<float> archivedH5 = array.new_float()
+var array<float> archivedH10 = array.new_float()
+var array<float> archivedH20 = array.new_float()
+var array<float> archivedMfe = array.new_float()
+var array<float> archivedMae = array.new_float()
+var array<string> archivedValidation = array.new_string()
+var array<string> archivedTiming = array.new_string()
+
+// ---------- ACTIVE OUTCOME ----------
+var bool outcomeActive = false
+var int outcomeSetupId = 0
+var int outcomeDirection = 0
+var int outcomeStartBar = na
+var float outcomeReference = na
+var float outcomeMfe = na
+var float outcomeMae = na
+var float outcomeAtr = na
+var float outcomeH1 = na
+var float outcomeH3 = na
+var float outcomeH5 = na
+var float outcomeH10 = na
+var float outcomeH20 = na
+var bool outcomeH1Done = false
+var bool outcomeH3Done = false
+var bool outcomeH5Done = false
+var bool outcomeH10Done = false
+var bool outcomeH20Done = false
+var string outcomeValidation = "PENDING"
+var string outcomeTiming = "PENDING"
+
+// ---------- HELPERS ----------
+classifyOutcome(_move, _threshold, _neutral) =>
+    _move >= _threshold ? "FAVORABLE" : _move <= -_threshold ? "ADVERSE" : math.abs(_move) <= _neutral ? "NEUTRAL" : _move > 0 ? "FAVORABLE" : "ADVERSE"
+
+archiveOutcome() =>
+    array.push(archivedSetupId, outcomeSetupId)
+    array.push(archivedDirection, outcomeDirection)
+    array.push(archivedDecision, outcomeDirection > 0 ? "LONG BIAS" : "SHORT BIAS")
+    array.push(archivedQuality, decisionQuality)
+    array.push(archivedConfidence, decisionConfidence)
+    array.push(archivedHealth, decisionHealth)
+    array.push(archivedH1, outcomeH1)
+    array.push(archivedH3, outcomeH3)
+    array.push(archivedH5, outcomeH5)
+    array.push(archivedH10, outcomeH10)
+    array.push(archivedH20, outcomeH20)
+    array.push(archivedMfe, outcomeMfe)
+    array.push(archivedMae, outcomeMae)
+    array.push(archivedValidation, outcomeValidation)
+    array.push(archivedTiming, outcomeTiming)
+    while array.size(archivedSetupId) > archiveLimit
+        array.shift(archivedSetupId)
+        array.shift(archivedDirection)
+        array.shift(archivedDecision)
+        array.shift(archivedQuality)
+        array.shift(archivedConfidence)
+        array.shift(archivedHealth)
+        array.shift(archivedH1)
+        array.shift(archivedH3)
+        array.shift(archivedH5)
+        array.shift(archivedH10)
+        array.shift(archivedH20)
+        array.shift(archivedMfe)
+        array.shift(archivedMae)
+        array.shift(archivedValidation)
+        array.shift(archivedTiming)
+
+startOutcome(_id, _direction) =>
+    outcomeActive := true
+    outcomeSetupId := _id
+    outcomeDirection := _direction
+    outcomeStartBar := bar_index
+    outcomeReference := close
+    outcomeMfe := 0.0
+    outcomeMae := 0.0
+    outcomeAtr := math.max(atr, syminfo.mintick)
+    outcomeH1 := na
+    outcomeH3 := na
+    outcomeH5 := na
+    outcomeH10 := na
+    outcomeH20 := na
+    outcomeH1Done := false
+    outcomeH3Done := false
+    outcomeH5Done := false
+    outcomeH10Done := false
+    outcomeH20Done := false
+    outcomeValidation := "PENDING"
+    outcomeTiming := "PENDING"
+
+// ---------- START NEW TRACK ----------
+if newDecision
+    if outcomeActive
+        archiveOutcome()
+    startOutcome(setupId, decisionDirection)
+
+// ---------- TRACK ACTIVE OUTCOME ----------
+if outcomeActive
+    signedHigh = outcomeDirection > 0 ? high - outcomeReference : outcomeReference - low
+    signedLow = outcomeDirection > 0 ? low - outcomeReference : outcomeReference - high
+    outcomeMfe := math.max(outcomeMfe, signedHigh)
+    outcomeMae := math.min(outcomeMae, signedLow)
+
+    barsElapsed = bar_index - outcomeStartBar
+    currentMoveAtr = (close - outcomeReference) / outcomeAtr * outcomeDirection
+
+    if not outcomeH1Done and barsElapsed >= h1Bars
+        outcomeH1 := currentMoveAtr
+        outcomeH1Done := true
+    if not outcomeH3Done and barsElapsed >= h3Bars
+        outcomeH3 := currentMoveAtr
+        outcomeH3Done := true
+    if not outcomeH5Done and barsElapsed >= h5Bars
+        outcomeH5 := currentMoveAtr
+        outcomeH5Done := true
+    if not outcomeH10Done and barsElapsed >= h10Bars
+        outcomeH10 := currentMoveAtr
+        outcomeH10Done := true
+    if not outcomeH20Done and barsElapsed >= h20Bars
+        outcomeH20 := currentMoveAtr
+        outcomeH20Done := true
+
+    if barsElapsed >= validationHorizon
+        validationMove = currentMoveAtr
+        outcomeValidation := validationMove >= favorableThresholdAtr ? "VALIDATED" : validationMove <= -favorableThresholdAtr ? "FAILED" : "NEUTRAL"
+        outcomeTiming := outcomeValidation == "VALIDATED" ? (barsElapsed <= slowValidationBars ? (barsElapsed <= h3Bars ? "FAST" : "NORMAL") : "SLOW") : outcomeValidation == "FAILED" ? "FAILED" : "NORMAL"
+
+    complete = outcomeH20Done
+    if complete
+        archiveOutcome()
+        outcomeActive := false
+
+// ---------- ANALYTICS OVER ARCHIVED OUTCOMES ----------
+archivedCount = array.size(archivedSetupId)
+validatedCount = 0
+failedCount = 0
+neutralCount = 0
+longCount = 0
+longValidated = 0
+shortCount = 0
+shortValidated = 0
+highCount = 0
+highValidated = 0
+mediumCount = 0
+mediumValidated = 0
+lowCount = 0
+lowValidated = 0
+healthyCount = 0
+healthyValidated = 0
+cautionCount = 0
+cautionValidated = 0
+deterioratingCount = 0
+deterioratingValidated = 0
+invalidCount = 0
+invalidValidated = 0
+
+if archivedCount > 0
+    for i = 0 to archivedCount - 1
+        v = array.get(archivedValidation, i)
+        d = array.get(archivedDirection, i)
+        q = array.get(archivedQuality, i)
+        h = array.get(archivedHealth, i)
+        isValidated = v == "VALIDATED"
+        validatedCount += isValidated ? 1 : 0
+        failedCount += v == "FAILED" ? 1 : 0
+        neutralCount += v == "NEUTRAL" ? 1 : 0
+        if d > 0
+            longCount += 1
+            longValidated += isValidated ? 1 : 0
+        else
+            shortCount += 1
+            shortValidated += isValidated ? 1 : 0
+        if q == "HIGH"
+            highCount += 1
+            highValidated += isValidated ? 1 : 0
+        else if q == "MEDIUM"
+            mediumCount += 1
+            mediumValidated += isValidated ? 1 : 0
+        else
+            lowCount += 1
+            lowValidated += isValidated ? 1 : 0
+        if h == "HEALTHY"
+            healthyCount += 1
+            healthyValidated += isValidated ? 1 : 0
+        else if h == "CAUTION"
+            cautionCount += 1
+            cautionValidated += isValidated ? 1 : 0
+        else if h == "DETERIORATING"
+            deterioratingCount += 1
+            deterioratingValidated += isValidated ? 1 : 0
+        else
+            invalidCount += 1
+            invalidValidated += isValidated ? 1 : 0
+
+rate(_wins, _count) => _count > 0 ? _wins / _count * 100.0 : na
+
+// ---------- UI ----------
+var table hud = table.new(position.top_right, 2, 14)
+if barstate.islast
+    table.cell(hud, 0, 0, "AUCTION AI v0.9")
+    table.cell(hud, 1, 0, "OUTCOME")
+    table.cell(hud, 0, 1, "Active Setup")
+    table.cell(hud, 1, 1, outcomeActive ? str.tostring(outcomeSetupId) : "NONE")
+    table.cell(hud, 0, 2, "Validation")
+    table.cell(hud, 1, 2, outcomeActive ? outcomeValidation : "ARCHIVED")
+    table.cell(hud, 0, 3, "MFE")
+    table.cell(hud, 1, 3, outcomeActive ? str.tostring(outcomeMfe, "#.##") + " ATR" : "-")
+    table.cell(hud, 0, 4, "MAE")
+    table.cell(hud, 1, 4, outcomeActive ? str.tostring(outcomeMae, "#.##") + " ATR" : "-")
+    table.cell(hud, 0, 5, "Archived")
+    table.cell(hud, 1, 5, str.tostring(archivedCount))
+    table.cell(hud, 0, 6, "Validated")
+    table.cell(hud, 1, 6, str.tostring(validatedCount) + " (" + str.tostring(rate(validatedCount, archivedCount), "#.0") + "%)")
+    table.cell(hud, 0, 7, "Failed")
+    table.cell(hud, 1, 7, str.tostring(failedCount))
+    table.cell(hud, 0, 8, "Neutral")
+    table.cell(hud, 1, 8, str.tostring(neutralCount))
+    table.cell(hud, 0, 9, "LONG")
+    table.cell(hud, 1, 9, str.tostring(longValidated) + "/" + str.tostring(longCount))
+    table.cell(hud, 0, 10, "SHORT")
+    table.cell(hud, 1, 10, str.tostring(shortValidated) + "/" + str.tostring(shortCount))
+    table.cell(hud, 0, 11, "HIGH Quality")
+    table.cell(hud, 1, 11, str.tostring(rate(highValidated, highCount), "#.0") + "%")
+    table.cell(hud, 0, 12, "MEDIUM Quality")
+    table.cell(hud, 1, 12, str.tostring(rate(mediumValidated, mediumCount), "#.0") + "%")
+    table.cell(hud, 0, 13, "LOW Quality")
+    table.cell(hud, 1, 13, str.tostring(rate(lowValidated, lowCount), "#.0") + "%")
+
+plot(outcomeActive ? outcomeReference : na, "Decision Reference", color=color.new(color.gray, 0), linewidth=1, style=plot.style_linebr)
