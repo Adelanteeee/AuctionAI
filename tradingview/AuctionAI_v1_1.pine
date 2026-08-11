@@ -1,0 +1,434 @@
+//@version=6
+indicator("AuctionAI v1.1 - Pattern Evaluation & Evidence Weight Research", overlay=true, max_bars_back=5000)
+
+// v1.1 — Pattern Evaluation & Evidence Weight Research
+// Extends the outcome archive with auditable evidence research.
+// Research only: NO automatic weight/threshold adaptation, ML, execution or trading.
+// Evidence is evaluated against observed Outcome, not used to change Decision rules.
+
+// ---------- INPUTS ----------
+validationHorizon = input.int(5, "Validation Horizon", minval=1)
+h1Bars = input.int(1, "H1 Bars", minval=1)
+h3Bars = input.int(3, "H3 Bars", minval=1)
+h5Bars = input.int(5, "H5 Bars", minval=1)
+h10Bars = input.int(10, "H10 Bars", minval=1)
+h20Bars = input.int(20, "H20 Bars", minval=1)
+favorableThresholdAtr = input.float(0.50, "Favorable Threshold (ATR)", minval=0.0, step=0.05)
+neutralThresholdAtr = input.float(0.10, "Neutral Threshold (ATR)", minval=0.0, step=0.05)
+slowValidationBars = input.int(10, "Slow Validation Bars", minval=1)
+archiveLimit = input.int(300, "Outcome Archive Size", minval=20, maxval=500)
+minSamples = input.int(20, "Minimum Research Samples", minval=2, maxval=500)
+evaluationPercent = input.int(30, "Evaluation Sample %", minval=10, maxval=50)
+
+// ---------- MARKET PROXIES ----------
+atr = ta.atr(14)
+atrSafe = math.max(atr, syminfo.mintick)
+barRange = high - low
+body = close - open
+volumeAvg = ta.sma(volume, 20)
+volumeSafe = math.max(volumeAvg, 1.0)
+
+// Conservative standalone compatibility layer.
+deltaProxy = body / atrSafe
+cvdProxy = ta.ema(deltaProxy, 5)
+effortRatio = volume / volumeSafe
+resultRatio = math.abs(body) / atrSafe
+absorptionProxy = effortRatio > 1.5 and resultRatio < 0.35
+contextState = math.abs(close - nz(close[10], close)) / atrSafe > 1.5 ? "TREND" : "RANGE"
+
+// Evidence flags captured at Decision time.
+deltaAlignedNow = body != 0
+cvdAlignedNow = (body > 0 and cvdProxy > 0) or (body < 0 and cvdProxy < 0)
+effortAlignedNow = effortRatio >= 1.0
+resultAlignedNow = body != 0 and math.abs(body) / atrSafe >= 0.5
+
+// ---------- STANDALONE DECISION COMPATIBILITY ----------
+var int decisionDirection = 0
+var string decisionState = "WAIT"
+var string decisionQuality = "LOW"
+var string decisionConfidence = "LOW"
+var string decisionHealth = "HEALTHY"
+var int setupId = 0
+
+longDecision = close > open and barRange > atrSafe * 0.75
+shortDecision = close < open and barRange > atrSafe * 0.75
+newDecision = longDecision or shortDecision
+
+if newDecision
+    setupId += 1
+    decisionDirection := longDecision ? 1 : -1
+    decisionState := longDecision ? "LONG BIAS" : "SHORT BIAS"
+    decisionQuality := barRange > atrSafe ? "HIGH" : "MEDIUM"
+    decisionConfidence := barRange > atrSafe * 1.25 ? "HIGH" : "MEDIUM"
+    decisionHealth := "HEALTHY"
+
+// ---------- OUTCOME ARCHIVE ----------
+var array<int> aSetup = array.new_int()
+var array<int> aDir = array.new_int()
+var array<string> aDecision = array.new_string()
+var array<string> aQuality = array.new_string()
+var array<string> aConfidence = array.new_string()
+var array<string> aHealth = array.new_string()
+var array<string> aContext = array.new_string()
+var array<bool> aDelta = array.new_bool()
+var array<bool> aCvd = array.new_bool()
+var array<bool> aEffort = array.new_bool()
+var array<bool> aResult = array.new_bool()
+var array<bool> aAbsorption = array.new_bool()
+var array<bool> aRetestHold = array.new_bool()
+var array<float> aH1 = array.new_float()
+var array<float> aH3 = array.new_float()
+var array<float> aH5 = array.new_float()
+var array<float> aH10 = array.new_float()
+var array<float> aH20 = array.new_float()
+var array<float> aMfe = array.new_float()
+var array<float> aMae = array.new_float()
+var array<string> aValidation = array.new_string()
+var array<string> aTiming = array.new_string()
+
+// ---------- ACTIVE OUTCOME ----------
+var bool outcomeActive = false
+var int outcomeSetupId = 0
+var int outcomeDirection = 0
+var int outcomeStartBar = na
+var float outcomeReference = na
+var float outcomeMfe = 0.0
+var float outcomeMae = 0.0
+var float outcomeAtr = na
+var float outcomeH1 = na
+var float outcomeH3 = na
+var float outcomeH5 = na
+var float outcomeH10 = na
+var float outcomeH20 = na
+var bool outcomeH1Done = false
+var bool outcomeH3Done = false
+var bool outcomeH5Done = false
+var bool outcomeH10Done = false
+var bool outcomeH20Done = false
+var string outcomeValidation = "PENDING"
+var string outcomeTiming = "PENDING"
+var string outcomeQuality = "LOW"
+var string outcomeConfidence = "LOW"
+var string outcomeHealth = "HEALTHY"
+var string outcomeContext = "RANGE"
+var bool outcomeDelta = false
+var bool outcomeCvd = false
+var bool outcomeEffort = false
+var bool outcomeResult = false
+var bool outcomeAbsorption = false
+
+classifyOutcome(_move, _threshold, _neutral) =>
+    _move >= _threshold ? "FAVORABLE" : _move <= -_threshold ? "ADVERSE" : math.abs(_move) <= _neutral ? "NEUTRAL" : _move > 0 ? "FAVORABLE" : "ADVERSE"
+
+archiveOutcome() =>
+    if outcomeSetupId > 0
+        array.push(aSetup, outcomeSetupId)
+        array.push(aDir, outcomeDirection)
+        array.push(aDecision, outcomeDirection > 0 ? "LONG BIAS" : "SHORT BIAS")
+        array.push(aQuality, outcomeQuality)
+        array.push(aConfidence, outcomeConfidence)
+        array.push(aHealth, outcomeHealth)
+        array.push(aContext, outcomeContext)
+        array.push(aDelta, outcomeDelta)
+        array.push(aCvd, outcomeCvd)
+        array.push(aEffort, outcomeEffort)
+        array.push(aResult, outcomeResult)
+        array.push(aAbsorption, outcomeAbsorption)
+        array.push(aRetestHold, outcomeH3 > -0.25)
+        array.push(aH1, outcomeH1)
+        array.push(aH3, outcomeH3)
+        array.push(aH5, outcomeH5)
+        array.push(aH10, outcomeH10)
+        array.push(aH20, outcomeH20)
+        array.push(aMfe, outcomeMfe)
+        array.push(aMae, outcomeMae)
+        array.push(aValidation, outcomeValidation)
+        array.push(aTiming, outcomeTiming)
+        while array.size(aSetup) > archiveLimit
+            array.shift(aSetup), array.shift(aDir), array.shift(aDecision), array.shift(aQuality), array.shift(aConfidence), array.shift(aHealth), array.shift(aContext), array.shift(aDelta), array.shift(aCvd), array.shift(aEffort), array.shift(aResult), array.shift(aAbsorption), array.shift(aRetestHold), array.shift(aH1), array.shift(aH3), array.shift(aH5), array.shift(aH10), array.shift(aH20), array.shift(aMfe), array.shift(aMae), array.shift(aValidation), array.shift(aTiming)
+
+startOutcome(_id, _direction) =>
+    outcomeActive := true
+    outcomeSetupId := _id
+    outcomeDirection := _direction
+    outcomeStartBar := bar_index
+    outcomeReference := close
+    outcomeMfe := 0.0
+    outcomeMae := 0.0
+    outcomeAtr := atrSafe
+    outcomeH1 := na
+    outcomeH3 := na
+    outcomeH5 := na
+    outcomeH10 := na
+    outcomeH20 := na
+    outcomeH1Done := false
+    outcomeH3Done := false
+    outcomeH5Done := false
+    outcomeH10Done := false
+    outcomeH20Done := false
+    outcomeValidation := "PENDING"
+    outcomeTiming := "PENDING"
+    outcomeQuality := decisionQuality
+    outcomeConfidence := decisionConfidence
+    outcomeHealth := decisionHealth
+    outcomeContext := contextState
+    outcomeDelta := deltaAlignedNow
+    outcomeCvd := cvdAlignedNow
+    outcomeEffort := effortAlignedNow
+    outcomeResult := resultAlignedNow
+    outcomeAbsorption := absorptionProxy
+
+if newDecision
+    if outcomeActive
+        archiveOutcome()
+    startOutcome(setupId, decisionDirection)
+
+if outcomeActive
+    signedHigh = outcomeDirection > 0 ? high - outcomeReference : outcomeReference - low
+    signedLow = outcomeDirection > 0 ? low - outcomeReference : outcomeReference - high
+    outcomeMfe := math.max(outcomeMfe, signedHigh)
+    outcomeMae := math.min(outcomeMae, signedLow)
+    barsElapsed = bar_index - outcomeStartBar
+    currentMoveAtr = (close - outcomeReference) / outcomeAtr * outcomeDirection
+
+    if not outcomeH1Done and barsElapsed >= h1Bars
+        outcomeH1 := currentMoveAtr
+        outcomeH1Done := true
+    if not outcomeH3Done and barsElapsed >= h3Bars
+        outcomeH3 := currentMoveAtr
+        outcomeH3Done := true
+    if not outcomeH5Done and barsElapsed >= h5Bars
+        outcomeH5 := currentMoveAtr
+        outcomeH5Done := true
+    if not outcomeH10Done and barsElapsed >= h10Bars
+        outcomeH10 := currentMoveAtr
+        outcomeH10Done := true
+    if not outcomeH20Done and barsElapsed >= h20Bars
+        outcomeH20 := currentMoveAtr
+        outcomeH20Done := true
+
+    if barsElapsed >= validationHorizon
+        outcomeValidation := currentMoveAtr >= favorableThresholdAtr ? "VALIDATED" : currentMoveAtr <= -favorableThresholdAtr ? "FAILED" : "NEUTRAL"
+        outcomeTiming := outcomeValidation == "VALIDATED" ? (barsElapsed <= slowValidationBars ? (barsElapsed <= h3Bars ? "FAST" : "NORMAL") : "SLOW") : outcomeValidation == "FAILED" ? "FAILED" : "NORMAL"
+
+    if outcomeH20Done
+        archiveOutcome()
+        outcomeActive := false
+
+// ---------- RESEARCH HELPERS ----------
+rate(_wins, _count) => _count > 0 ? _wins / _count * 100.0 : na
+reliability(_count, _rate, _baseline) => _count < minSamples ? "INSUFFICIENT" : _count >= minSamples * 4 and math.abs(_rate - _baseline) >= 10 ? "HIGH" : _count >= minSamples * 2 and math.abs(_rate - _baseline) >= 5 ? "MEDIUM" : "LOW"
+stability(_v1, _n1, _v2, _n2, _v3, _n3) => _n1 < 2 or _n2 < 2 or _n3 < 2 ? "INSUFFICIENT" : math.max(math.abs(_v1 - _v2), math.abs(_v2 - _v3), math.abs(_v1 - _v3)) <= 10 ? "STABLE" : _v3 > _v1 ? "IMPROVING" : "DETERIORATING"
+
+// ---------- DATASET SPLIT ----------
+N = array.size(aSetup)
+evalCount = int(math.floor(N * evaluationPercent / 100.0))
+researchCount = N - evalCount
+baselineWins = 0
+researchWins = 0
+researchLoss = 0
+researchNeutral = 0
+
+// Evidence counters: each evidence has aligned/conflict buckets.
+deltaN = 0
+deltaW = 0
+cvdN = 0
+cvdW = 0
+effortN = 0
+effortW = 0
+resultN = 0
+resultW = 0
+absN = 0
+absW = 0
+
+// Pair counters.
+dcN = 0
+dcW = 0
+drN = 0
+drW = 0
+caN = 0
+caW = 0
+crN = 0
+crW = 0
+
+// Context and retest conditioning.
+trendN = 0
+trendW = 0
+rangeN = 0
+rangeW = 0
+holdN = 0
+holdW = 0
+weakN = 0
+weakW = 0
+
+// Stability buckets over chronological thirds.
+deltaR1N = 0
+deltaR1W = 0
+deltaR2N = 0
+deltaR2W = 0
+deltaR3N = 0
+deltaR3W = 0
+
+if N > 0
+    for i = 0 to N - 1
+        isEval = i >= researchCount
+        v = array.get(aValidation, i)
+        win = v == "VALIDATED"
+        if not isEval
+            researchWins += win ? 1 : 0
+            researchLoss += v == "FAILED" ? 1 : 0
+            researchNeutral += v == "NEUTRAL" ? 1 : 0
+            baselineWins += win ? 1 : 0
+
+            d = array.get(aDelta, i)
+            c = array.get(aCvd, i)
+            e = array.get(aEffort, i)
+            r = array.get(aResult, i)
+            ab = array.get(aAbsorption, i)
+            hold = array.get(aRetestHold, i)
+            ctx = array.get(aContext, i)
+
+            deltaN += d ? 1 : 0
+            deltaW += d and win ? 1 : 0
+            cvdN += c ? 1 : 0
+            cvdW += c and win ? 1 : 0
+            effortN += e ? 1 : 0
+            effortW += e and win ? 1 : 0
+            resultN += r ? 1 : 0
+            resultW += r and win ? 1 : 0
+            absN += ab ? 1 : 0
+            absW += ab and win ? 1 : 0
+
+            dc = d and c
+            dr = d and r
+            ca = c and ab
+            cr = c and r
+            dcN += dc ? 1 : 0
+            dcW += dc and win ? 1 : 0
+            drN += dr ? 1 : 0
+            drW += dr and win ? 1 : 0
+            caN += ca ? 1 : 0
+            caW += ca and win ? 1 : 0
+            crN += cr ? 1 : 0
+            crW += cr and win ? 1 : 0
+
+            trendN += ctx == "TREND" ? 1 : 0
+            trendW += ctx == "TREND" and win ? 1 : 0
+            rangeN += ctx == "RANGE" ? 1 : 0
+            rangeW += ctx == "RANGE" and win ? 1 : 0
+            holdN += hold ? 1 : 0
+            holdW += hold and win ? 1 : 0
+            weakN += hold ? 0 : 1
+            weakW += not hold and win ? 1 : 0
+
+            third = researchCount > 0 ? int(math.floor(i * 3 / researchCount)) : 0
+            if third == 0
+                deltaR1N += d ? 1 : 0
+                deltaR1W += d and win ? 1 : 0
+            else if third == 1
+                deltaR2N += d ? 1 : 0
+                deltaR2W += d and win ? 1 : 0
+            else
+                deltaR3N += d ? 1 : 0
+                deltaR3W += d and win ? 1 : 0
+
+// ---------- RESEARCH METRICS ----------
+baselineRate = rate(baselineWins, researchCount)
+deltaRate = rate(deltaW, deltaN)
+cvdRate = rate(cvdW, cvdN)
+effortRate = rate(effortW, effortN)
+resultRate = rate(resultW, resultN)
+absRate = rate(absW, absN)
+dcRate = rate(dcW, dcN)
+drRate = rate(drW, drN)
+caRate = rate(caW, caN)
+crRate = rate(crW, crN)
+trendRate = rate(trendW, trendN)
+rangeRate = rate(rangeW, rangeN)
+holdRate = rate(holdW, holdN)
+weakRate = rate(weakW, weakN)
+
+deltaLift = not na(deltaRate) and not na(baselineRate) ? deltaRate - baselineRate : na
+cvdLift = not na(cvdRate) and not na(baselineRate) ? cvdRate - baselineRate : na
+effortLift = not na(effortRate) and not na(baselineRate) ? effortRate - baselineRate : na
+resultLift = not na(resultRate) and not na(baselineRate) ? resultRate - baselineRate : na
+absPenalty = not na(absRate) and not na(baselineRate) ? absRate - baselineRate : na
+
+// ---------- OUT-OF-SAMPLE EVALUATION ----------
+evalWins = 0
+evalN = 0
+if evalCount > 0
+    for i = researchCount to N - 1
+        evalN += 1
+        evalWins += array.get(aValidation, i) == "VALIDATED" ? 1 : 0
+evalRate = rate(evalWins, evalN)
+
+// ---------- HUD ----------
+var table hud = table.new(position.top_right, 4, 19)
+fmtPct(_x) => na(_x) ? "-" : str.tostring(_x, "#.0") + "%"
+fmtLift(_x) => na(_x) ? "-" : (_x >= 0 ? "+" : "") + str.tostring(_x, "#.0") + " pp"
+
+if barstate.islast
+    table.clear(hud, 0, 0, 3, 18)
+    table.cell(hud, 0, 0, "AUCTION AI v1.1")
+    table.cell(hud, 1, 0, "PATTERN RESEARCH")
+    table.cell(hud, 2, 0, "N=" + str.tostring(N))
+    table.cell(hud, 3, 0, "Min=" + str.tostring(minSamples))
+    table.cell(hud, 0, 1, "BASELINE")
+    table.cell(hud, 1, 1, fmtPct(baselineRate))
+    table.cell(hud, 2, 1, "Eval")
+    table.cell(hud, 3, 1, fmtPct(evalRate))
+    table.cell(hud, 0, 2, "DELTA")
+    table.cell(hud, 1, 2, str.tostring(deltaN) + " | " + fmtLift(deltaLift))
+    table.cell(hud, 2, 2, reliability(deltaN, deltaRate, baselineRate))
+    table.cell(hud, 3, 2, stability(rate(deltaR1W, deltaR1N), deltaR1N, rate(deltaR2W, deltaR2N), deltaR2N, rate(deltaR3W, deltaR3N), deltaR3N))
+    table.cell(hud, 0, 3, "CVD")
+    table.cell(hud, 1, 3, str.tostring(cvdN) + " | " + fmtLift(cvdLift))
+    table.cell(hud, 2, 3, reliability(cvdN, cvdRate, baselineRate))
+    table.cell(hud, 0, 4, "EFFORT")
+    table.cell(hud, 1, 4, str.tostring(effortN) + " | " + fmtLift(effortLift))
+    table.cell(hud, 2, 4, reliability(effortN, effortRate, baselineRate))
+    table.cell(hud, 0, 5, "RESULT")
+    table.cell(hud, 1, 5, str.tostring(resultN) + " | " + fmtLift(resultLift))
+    table.cell(hud, 2, 5, reliability(resultN, resultRate, baselineRate))
+    table.cell(hud, 0, 6, "ABSORPTION")
+    table.cell(hud, 1, 6, str.tostring(absN) + " | " + fmtLift(absPenalty))
+    table.cell(hud, 2, 6, reliability(absN, absRate, baselineRate))
+    table.cell(hud, 0, 7, "DELTA × CVD")
+    table.cell(hud, 1, 7, str.tostring(dcN) + " | " + fmtLift(not na(dcRate) and not na(baselineRate) ? dcRate - baselineRate : na))
+    table.cell(hud, 2, 7, reliability(dcN, dcRate, baselineRate))
+    table.cell(hud, 0, 8, "DELTA × RESULT")
+    table.cell(hud, 1, 8, str.tostring(drN) + " | " + fmtLift(not na(drRate) and not na(baselineRate) ? drRate - baselineRate : na))
+    table.cell(hud, 2, 8, reliability(drN, drRate, baselineRate))
+    table.cell(hud, 0, 9, "CVD × ABS")
+    table.cell(hud, 1, 9, str.tostring(caN) + " | " + fmtLift(not na(caRate) and not na(baselineRate) ? caRate - baselineRate : na))
+    table.cell(hud, 2, 9, reliability(caN, caRate, baselineRate))
+    table.cell(hud, 0, 10, "CVD × RESULT")
+    table.cell(hud, 1, 10, str.tostring(crN) + " | " + fmtLift(not na(crRate) and not na(baselineRate) ? crRate - baselineRate : na))
+    table.cell(hud, 2, 10, reliability(crN, crRate, baselineRate))
+    table.cell(hud, 0, 11, "TREND")
+    table.cell(hud, 1, 11, str.tostring(trendN) + " | " + fmtPct(trendRate))
+    table.cell(hud, 2, 11, reliability(trendN, trendRate, baselineRate))
+    table.cell(hud, 0, 12, "RANGE")
+    table.cell(hud, 1, 12, str.tostring(rangeN) + " | " + fmtPct(rangeRate))
+    table.cell(hud, 2, 12, reliability(rangeN, rangeRate, baselineRate))
+    table.cell(hud, 0, 13, "RETEST HOLD")
+    table.cell(hud, 1, 13, str.tostring(holdN) + " | " + fmtPct(holdRate))
+    table.cell(hud, 2, 13, reliability(holdN, holdRate, baselineRate))
+    table.cell(hud, 0, 14, "RETEST WEAK")
+    table.cell(hud, 1, 14, str.tostring(weakN) + " | " + fmtPct(weakRate))
+    table.cell(hud, 2, 14, reliability(weakN, weakRate, baselineRate))
+    table.cell(hud, 0, 15, "QUALITY")
+    table.cell(hud, 1, 15, "Research only")
+    table.cell(hud, 2, 15, "NO AUTO WEIGHT")
+    table.cell(hud, 0, 16, "OOS")
+    table.cell(hud, 1, 16, str.tostring(evalN) + " samples")
+    table.cell(hud, 2, 16, fmtPct(evalRate))
+    table.cell(hud, 0, 17, "RESEARCH")
+    table.cell(hud, 1, 17, str.tostring(researchCount) + " samples")
+    table.cell(hud, 2, 17, fmtPct(baselineRate))
+    table.cell(hud, 0, 18, "STATUS")
+    table.cell(hud, 1, 18, "AUDIT / RESEARCH")
+    table.cell(hud, 2, 18, "NO LEARNING")
+
+plot(outcomeActive ? outcomeReference : na, "Decision Reference", color=color.new(color.gray, 0), linewidth=1, style=plot.style_linebr)
