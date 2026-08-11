@@ -315,33 +315,61 @@ dcN=0,dcW=0,drN=0,drW=0,ceN=0,ceW=0,caN=0,caW=0,hcN=0,hcW=0
 
 if N > 0
     for i = 0 to N - 1
-        v = array.get(aValidation, i)
-        win = v == "VALIDATED"
+        win = array.get(aValidation, i) == "VALIDATED"
         if i < researchCount
             researchBaseN += 1
             researchBaseW += win ? 1 : 0
-            d = array.get(aDelta,i), c = array.get(aCvd,i), e = array.get(aEffort,i), r = array.get(aResult,i)
-            b = array.get(aBody,i), br = array.get(aBreakout,i), noAbs = array.get(aNoAbsorption,i), hold = array.get(aRetestHold,i)
-            dir = array.get(aDir,i), ctx = array.get(aContext,i)
-            dTN += d ? 1:0, dTW += d and win ? 1:0
-            cTN += c ? 1:0, cTW += c and win ? 1:0
-            eTN += e ? 1:0, eTW += e and win ? 1:0
-            rTN += r ? 1:0, rTW += r and win ? 1:0
-            bodyN += b ? 1:0, bodyW += b and win ? 1:0
-            breakN += br ? 1:0, breakW += br and win ? 1:0
-            absN += not noAbs ? 1:0, absW += not noAbs and win ? 1:0
-            cLongN += c and dir > 0 ? 1:0, cLongW += c and dir > 0 and win ? 1:0
-            cShortN += c and dir < 0 ? 1:0, cShortW += c and dir < 0 and win ? 1:0
-            cTrendN += c and ctx == "TREND" ? 1:0, cTrendW += c and ctx == "TREND" and win ? 1:0
-            cRangeN += c and ctx == "RANGE" ? 1:0, cRangeW += c and ctx == "RANGE" and win ? 1:0
-            cHoldN += c and hold ? 1:0, cHoldW += c and hold and win ? 1:0
-            cWeakN += c and not hold ? 1:0, cWeakW += c and not hold and win ? 1:0
-            dc = d and c, dr = d and r, ce = c and e, ca = c and not noAbs, hc = c and hold
-            dcN += dc ? 1:0, dcW += dc and win ? 1:0
-            drN += dr ? 1:0, drW += dr and win ? 1:0
-            ceN += ce ? 1:0, ceW += ce and win ? 1:0
-            caN += ca ? 1:0, caW += ca and win ? 1:0
-            hcN += hc ? 1:0, hcW += hc and win ? 1:0
+            d = array.get(aDelta, i)
+            c = array.get(aCvd, i)
+            e = array.get(aEffort, i)
+            r = array.get(aResult, i)
+            b = array.get(aBody, i)
+            br = array.get(aBreakout, i)
+            noAbs = array.get(aNoAbsorption, i)
+            hold = array.get(aRetestHold, i)
+            dir = array.get(aDir, i)
+            ctx = array.get(aContext, i)
+            dTN += d ? 1 : 0
+            dTW += d and win ? 1 : 0
+            cTN += c ? 1 : 0
+            cTW += c and win ? 1 : 0
+            eTN += e ? 1 : 0
+            eTW += e and win ? 1 : 0
+            rTN += r ? 1 : 0
+            rTW += r and win ? 1 : 0
+            bodyN += b ? 1 : 0
+            bodyW += b and win ? 1 : 0
+            breakN += br ? 1 : 0
+            breakW += br and win ? 1 : 0
+            absN += not noAbs ? 1 : 0
+            absW += not noAbs and win ? 1 : 0
+            cLongN += c and dir > 0 ? 1 : 0
+            cLongW += c and dir > 0 and win ? 1 : 0
+            cShortN += c and dir < 0 ? 1 : 0
+            cShortW += c and dir < 0 and win ? 1 : 0
+            cTrendN += c and ctx == "TREND" ? 1 : 0
+            cTrendW += c and ctx == "TREND" and win ? 1 : 0
+            cRangeN += c and ctx == "RANGE" ? 1 : 0
+            cRangeW += c and ctx == "RANGE" and win ? 1 : 0
+            cHoldN += c and hold ? 1 : 0
+            cHoldW += c and hold and win ? 1 : 0
+            cWeakN += c and not hold ? 1 : 0
+            cWeakW += c and not hold and win ? 1 : 0
+            dc = d and c
+            dr = d and r
+            ce = c and e
+            ca = c and not noAbs
+            hc = hold and c
+            dcN += dc ? 1 : 0
+            dcW += dc and win ? 1 : 0
+            drN += dr ? 1 : 0
+            drW += dr and win ? 1 : 0
+            ceN += ce ? 1 : 0
+            ceW += ce and win ? 1 : 0
+            caN += ca ? 1 : 0
+            caW += ca and win ? 1 : 0
+            hcN += hc ? 1 : 0
+            hcW += hc and win ? 1 : 0
             bucket = researchCount > 0 ? math.min(2, int(math.floor(i * 3.0 / researchCount))) : 0
             if bucket == 0
                 dR1N += d?1:0, dR1W += d and win?1:0, cR1N += c?1:0, cR1W += c and win?1:0, eR1N += e?1:0, eR1W += e and win?1:0, rR1N += r?1:0, rR1W += r and win?1:0, bR1N += b?1:0, bR1W += b and win?1:0, xR1N += br?1:0, xR1W += br and win?1:0, aR1N += not noAbs?1:0, aR1W += not noAbs and win?1:0
@@ -353,11 +381,6 @@ if N > 0
             evalBaseN += 1
             evalBaseW += win ? 1 : 0
 
-researchBaseline = rate(researchBaseW,researchBaseN)
-evalBaseline = rate(evalBaseW,evalBaseN)
-dRate=rate(dTW,dTN), cRate=rate(cTW,cTN), eRate=rate(eTW,eTN), rRate=rate(rTW,rTN), bodyRate=rate(bodyW,bodyN), breakRate=rate(breakW,breakN), absRate=rate(absW,absN)
-
-// ========================= EVALUATION / OOS =========================
 evalDN=0,evalDW=0,evalCN=0,evalCW=0,evalEN=0,evalEW=0,evalRN=0,evalRW=0,evalBodyN=0,evalBodyW=0,evalBreakN=0,evalBreakW=0,evalAbsN=0,evalAbsW=0
 if evalCount > 0
     for i = researchCount to N-1
@@ -372,6 +395,9 @@ if evalCount > 0
         evalAbsN += not noAbs?1:0, evalAbsW += not noAbs and win?1:0
 
 evalDRate=rate(evalDW,evalDN), evalCRate=rate(evalCW,evalCN), evalERate=rate(evalEW,evalEN), evalRRate=rate(evalRW,evalRN), evalBodyRate=rate(evalBodyW,evalBodyN), evalBreakRate=rate(evalBreakW,evalBreakN), evalAbsRate=rate(evalAbsW,evalAbsN)
+researchBaseline = rate(researchBaseW,researchBaseN)
+evalBaseline = rate(evalBaseW,evalBaseN)
+dRate=rate(dTW,dTN), cRate=rate(cTW,cTN), eRate=rate(eTW,eTN), rRate=rate(rTW,rTN), bodyRate=rate(bodyW,bodyN), breakRate=rate(breakW,breakN), absRate=rate(absW,absN)
 
 // ========================= RECOMMENDATIONS =========================
 [dRec,dDelta,dStrength,dStatus,dLift,dOos,dStable,dRel] = recommendation(dTN,dRate,researchBaseline,evalDRate,evalBaseline,rate(dR1W,dR1N),rate(dR2W,dR2N),rate(dR3W,dR3N),weightDelta,false)
@@ -380,7 +406,7 @@ evalDRate=rate(evalDW,evalDN), evalCRate=rate(evalCW,evalCN), evalERate=rate(eva
 [rRec,rDelta,rStrength,rStatus,rLift,rOos,rStable,rRel] = recommendation(rTN,rRate,researchBaseline,evalRRate,evalBaseline,rate(rR1W,rR1N),rate(rR2W,rR2N),rate(rR3W,rR3N),weightResult,false)
 [bRec,bDelta,bStrength,bStatus,bLift,bOos,bStable,bRel] = recommendation(bodyN,bodyRate,researchBaseline,evalBodyRate,evalBaseline,rate(bR1W,bR1N),rate(bR2W,bR2N),rate(bR3W,bR3N),weightBody,false)
 [xRec,xDelta,xStrength,xStatus,xLift,xOos,xStable,xRel] = recommendation(breakN,breakRate,researchBaseline,evalBreakRate,evalBaseline,rate(xR1W,xR1N),rate(xR2W,xR2N),rate(xR3W,xR3N),weightBreakout,false)
-[aRec,aDelta,aStrength,aStatus,aLift,aOos,aStable,aRel] = recommendation(absN,absRate,researchBaseline,evalAbsRate,evalBaseline,rate(aR1W,aR1N),rate(aR2W,aR2N),rate(aR3W,aR3N),weightAbsorption,true)
+[aRec,absRecDelta,aStrength,aStatus,aLift,aOos,aStable,aRel] = recommendation(absN,absRate,researchBaseline,evalAbsRate,evalBaseline,rate(aR1W,aR1N),rate(aR2W,aR2N),rate(aR3W,aR3N),weightAbsorption,true)
 
 // ========================= CONDITIONAL / INTERACTION RESEARCH =========================
 rateCLong = rate(cLongW,cLongN), rateCShort = rate(cShortW,cShortN), rateTrend = rate(cTrendW,cTrendN), rateRange = rate(cRangeW,cRangeN), rateHold = rate(cHoldW,cHoldN), rateWeak = rate(cWeakW,cWeakN)
@@ -422,7 +448,7 @@ if barstate.islast
     table.cell(hud,0,5,"RESULT"),table.cell(hud,1,5,str.tostring(weightResult)),table.cell(hud,2,5,str.tostring(rRec)),table.cell(hud,3,5,str.tostring(rDelta)),table.cell(hud,4,5,rStrength),table.cell(hud,5,5,rRel)
     table.cell(hud,0,6,"STRONG BODY"),table.cell(hud,1,6,str.tostring(weightBody)),table.cell(hud,2,6,str.tostring(bRec)),table.cell(hud,3,6,str.tostring(bDelta)),table.cell(hud,4,6,bStrength),table.cell(hud,5,6,bRel)
     table.cell(hud,0,7,"BREAKOUT"),table.cell(hud,1,7,str.tostring(weightBreakout)),table.cell(hud,2,7,str.tostring(xRec)),table.cell(hud,3,7,str.tostring(xDelta)),table.cell(hud,4,7,xStrength),table.cell(hud,5,7,xRel)
-    table.cell(hud,0,8,"ABSORPTION"),table.cell(hud,1,8,str.tostring(weightAbsorption)),table.cell(hud,2,8,str.tostring(aRec)),table.cell(hud,3,8,str.tostring(aDelta)),table.cell(hud,4,8,aStrength),table.cell(hud,5,8,aRel)
+    table.cell(hud,0,8,"ABSORPTION"),table.cell(hud,1,8,str.tostring(weightAbsorption)),table.cell(hud,2,8,str.tostring(aRec)),table.cell(hud,3,8,str.tostring(absRecDelta)),table.cell(hud,4,8,aStrength),table.cell(hud,5,8,aRel)
     table.cell(hud,0,9,"BASELINE"),table.cell(hud,1,9,fmtPct(researchBaseline)),table.cell(hud,2,9,"OOS"),table.cell(hud,3,9,fmtPct(evalBaseline)),table.cell(hud,4,9,"Research"),table.cell(hud,5,9,str.tostring(researchCount))
     table.cell(hud,0,10,"CVD LONG"),table.cell(hud,1,10,str.tostring(cLongN)),table.cell(hud,2,10,fmtLift(cLongLift)),table.cell(hud,3,10,"DIR"),table.cell(hud,4,10,"CVD SHORT"),table.cell(hud,5,10,fmtLift(cShortLift))
     table.cell(hud,0,11,"CVD TREND"),table.cell(hud,1,11,str.tostring(cTrendN)),table.cell(hud,2,11,fmtLift(trendLift)),table.cell(hud,3,11,"TREND"),table.cell(hud,4,11,"CVD RANGE"),table.cell(hud,5,11,fmtLift(rangeLift))
@@ -435,10 +461,6 @@ if barstate.islast
     table.cell(hud,0,18,"OOS ABS"),table.cell(hud,1,18,fmtPct(evalAbsRate)),table.cell(hud,2,18,fmtLift(aOos)),table.cell(hud,3,18,"ALL OOS"),table.cell(hud,4,18,"IMPLEMENTED"),table.cell(hud,5,18,"YES")
     table.cell(hud,0,19,"QUALITY HIGH"),table.cell(hud,1,19,str.tostring(qHighN)),table.cell(hud,2,19,fmtPct(qHighRate)),table.cell(hud,3,19,"MEDIUM"),table.cell(hud,4,19,str.tostring(qMedN)),table.cell(hud,5,19,fmtPct(qMedRate))
     table.cell(hud,0,20,"CONF HIGH"),table.cell(hud,1,20,str.tostring(cfHighN)),table.cell(hud,2,20,fmtPct(cfHighRate)),table.cell(hud,3,20,"MEDIUM"),table.cell(hud,4,20,str.tostring(cfMedN)),table.cell(hud,5,20,fmtPct(cfMedRate))
-    table.cell(hud,0,21,"STABILITY"),table.cell(hud,1,21,"3 REAL BUCKETS"),table.cell(hud,2,21,"CVD="+cStable?"HIGH":"LOW"),table.cell(hud,3,21,"EFFORT="+eStable?"HIGH":"LOW"),table.cell(hud,4,21,"RESULT="+rStable?"HIGH":"LOW"),table.cell(hud,5,21,"BODY="+bStable?"HIGH":"LOW")
+    table.cell(hud,0,21,"STABILITY"),table.cell(hud,1,21,"3 REAL BUCKETS"),table.cell(hud,2,21,"CVD="+ (cStable?"HIGH":"LOW")),table.cell(hud,3,21,"EFFORT="+ (eStable?"HIGH":"LOW")),table.cell(hud,4,21,"RESULT="+ (rStable?"HIGH":"LOW")),table.cell(hud,5,21,"BODY="+ (bStable?"HIGH":"LOW"))
     table.cell(hud,0,22,"SETUP"),table.cell(hud,1,22,outcomeActive?"TRACKING #"+str.tostring(outcomeSetupId):"IDLE"),table.cell(hud,2,22,outcomeValidation),table.cell(hud,3,22,decisionState),table.cell(hud,4,22,decisionQuality),table.cell(hud,5,22,decisionConfidence)
     table.cell(hud,0,23,"GUARD"),table.cell(hud,1,23,"WEIGHTS FROZEN"),table.cell(hud,2,23,"Δ≤±"+str.tostring(maxWeightDelta)),table.cell(hud,3,23,"MIN="+str.tostring(minResearchSamples)),table.cell(hud,4,23,"REC MIN="+str.tostring(recommendationMinSamples)),table.cell(hud,5,23,"OOS="+str.tostring(evaluationPercent)+"%")
-    table.cell(hud,0,24,"RELIABILITY"),table.cell(hud,1,24,"INDEPENDENT"),table.cell(hud,2,24,"SAMPLE+STABILITY"),table.cell(hud,3,24,"+OOS"),table.cell(hud,4,24,"NO RAW RATE ONLY"),table.cell(hud,5,24,"AUDIT")
-    table.cell(hud,0,25,"VERSION"),table.cell(hud,1,25,"v1.2"),table.cell(hud,2,25,"Weight Recommendation"),table.cell(hud,3,25,"Research"),table.cell(hud,4,25,"Human Review"),table.cell(hud,5,25,"SAFE")
-
-plot(outcomeActive ? outcomeReference : na, "Decision Reference", color=color.new(color.gray, 0), linewidth=1, style=plot.style_linebr)
