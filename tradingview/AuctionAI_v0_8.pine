@@ -353,6 +353,12 @@ else
 
 invalidationCandidateConfirmed = invalidationCandidateCount >= invalidationCandidateBars
 
+// Confirmed invalidation is a real Decision State, not only a diagnostic flag.
+if invalidationCandidateConfirmed and (decisionState == DEC_LONG or decisionState == DEC_SHORT)
+    decisionState := DEC_INVALID
+    decisionAge := 0
+    invalidationCandidateCount := 0
+
 // Recovery: a deteriorating decision can recover without passing through INVALIDATED.
 var int recoveryBars = 0
 recoveryEvidence = (decisionState == DEC_LONG and direction == 1 and deltaAligned and cvdAligned and conflictCount == 0 and state == RETEST_HOLD) or (decisionState == DEC_SHORT and direction == -1 and deltaAligned and cvdAligned and conflictCount == 0 and state == RETEST_HOLD)
