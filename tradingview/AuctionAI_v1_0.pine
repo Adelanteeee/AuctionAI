@@ -2,7 +2,12 @@
 indicator("AuctionAI v1.0 - Performance & Pattern Analytics", overlay=true)
 
 // v1.0 — Performance Analytics, Pattern Analytics & Outcome Archive
-// Extends v0.9 with read-only analytics over archived Decision Outcomes.
-// No Gate, Decision, threshold, weighting or execution logic is auto-modified.
-// Outcome remains price behavior after a Decision Snapshot — NOT a trade/P&L.
+// Read-only analytics over archived Decision Outcomes.
+// No automatic decision, threshold, weighting or execution changes.
+// Outcome is price behavior after a Decision reference — NOT a trade/P&L.
 
+// This file is the v1.0 placeholder currently present in the repository.
+// The original complete uploaded v1.0 source is not available in the connected
+// GitHub file history; it must be re-uploaded to replace this exact file safely.
+
+plot(na, "v1.0 placeholder")
