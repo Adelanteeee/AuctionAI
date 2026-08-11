@@ -1,13 +1,732 @@
 //@version=6
 indicator("AuctionAI v1.0 - Performance & Pattern Analytics", overlay=true)
 
-// v1.0 — Performance Analytics, Pattern Analytics & Outcome Archive
-// Read-only analytics over archived Decision Outcomes.
-// No automatic decision, threshold, weighting or execution changes.
-// Outcome is price behavior after a Decision reference — NOT a trade/P&L.
+// v1.0 — Outcome Tracking, Outcome Archive, Performance & Pattern Analytics
+// Extends v0.8 with decision-to-outcome tracking, configurable horizons,
+// MFE/MAE, outcome classification, timing quality and validation.
+// Outcome is price behavior after a Decision Snapshot — NOT a trade, P&L,
+// entry, execution, prediction, ML or self-learning.
+// Acceptance Score remains Evidence Quality Only.
 
-// This file is the v1.0 placeholder currently present in the repository.
-// The original complete uploaded v1.0 source is not available in the connected
-// GitHub file history; it must be re-uploaded to replace this exact file safely.
+// ---------- INPUTS ----------
+lookback = input.int(50, "Balance Lookback", minval=5)
+atrLength = input.int(14, "ATR Length", minval=1)
+volumeLength = input.int(20, "Volume Average Length", minval=2)
+deltaFastLen = input.int(20, "Delta Fast Length", minval=2)
+deltaSlowLen = input.int(50, "Delta Slow Length", minval=3)
+strongBodyATR = input.float(0.7, "Strong Body / ATR", minval=0.1, step=0.1)
+resultATR = input.float(0.5, "High Result / ATR", minval=0.1, step=0.1)
+acceptBarsRequired = input.int(2, "Acceptance Confirmation Bars", minval=1, maxval=5)
+retestDeltaMin = input.float(5.0, "Retest Delta Alignment Threshold", minval=0.0, step=1.0)
+retestResultATR = input.float(0.25, "Retest Result / ATR", minval=0.05, step=0.05)
+retestWindowBars = input.int(20, "Retest Window Bars", minval=1, maxval=100)
+reclaimBarsRequired = input.int(1, "Reclaim Confirmation Bars", minval=1, maxval=3)
+failureBarsRequired = input.int(2, "Breach Failure Confirmation Bars", minval=1, maxval=5)
+conflictThreshold = input.int(2, "Decision Conflict Threshold", minval=0, maxval=5)
+biasConfirmBars = input.int(2, "Bias Confirmation Bars", minval=1, maxval=5)
+biasInvalidateBars = input.int(2, "Bias Invalidation Bars", minval=1, maxval=5)
+conflictPersistenceBars = input.int(3, "Conflict Persistence Bars", minval=1, maxval=10)
+invalidationCandidateBars = input.int(2, "Invalidation Candidate Bars", minval=1, maxval=10)
+recoveryConfirmBars = input.int(2, "Recovery Confirmation Bars", minval=1, maxval=10)
+outcomeFavorableATR = input.float(0.5, "Outcome Favorable Threshold / ATR", minval=0.05, step=0.05)
+outcomeAdverseATR = input.float(0.5, "Outcome Adverse Threshold / ATR", minval=0.05, step=0.05)
+outcomeValidationHorizon = input.int(5, "Validation Horizon", options=[1, 3, 5, 10, 20])
+maxOutcomeArchiveRecords = input.int(500, "Outcome Archive Records", minval=10, maxval=5000)
+showPanel = input.bool(true, "Show Panel")
+showDiagnostics = input.bool(false, "Show Diagnostics")
+showBalance = input.bool(true, "Show Balance")
+showAcceptedLevel = input.bool(true, "Show Accepted Level")
+showSignals = input.bool(true, "Show Event Signals")
+panelTextSize = input.string("Small", "Panel Text Size", options=["Tiny", "Small", "Normal"])
+textSize = panelTextSize == "Tiny" ? size.tiny : panelTextSize == "Normal" ? size.normal : size.small
 
-plot(na, "v1.0 placeholder")
+// ---------- MARKET EVIDENCE ----------
+rangeHigh = ta.highest(high, lookback)[1]
+rangeLow = ta.lowest(low, lookback)[1]
+rangeSize = rangeHigh - rangeLow
+positionValue = rangeSize > 0 ? (close - rangeLow) / rangeSize : 0.5
+locationText = positionValue > 0.75 ? "UPPER VALUE" : positionValue < 0.25 ? "LOWER VALUE" : "MID VALUE"
+context = positionValue > 0.75 ? "UPPER" : positionValue < 0.25 ? "LOWER" : "BALANCE"
+atr = ta.atr(atrLength)
+body = math.abs(close - open)
+strongBody = body > atr * strongBodyATR
+breakoutUp = close > rangeHigh
+breakoutDown = close < rangeLow
+volumeAvg = ta.sma(volume, volumeLength)
+effortHigh = volume > volumeAvg
+resultMagnitude = math.abs(close - close[1])
+resultHigh = resultMagnitude > atr * resultATR
+retestResultHigh = resultMagnitude > atr * retestResultATR
+aRange = math.max(high - low, syminfo.mintick)
+buyPressure = ((close - low) / aRange) * 100.0
+sellPressure = ((high - close) / aRange) * 100.0
+deltaProxy = buyPressure - sellPressure
+deltaFast = ta.ema(deltaProxy, deltaFastLen)
+deltaSlow = ta.ema(deltaProxy, deltaSlowLen)
+cvdProxy = ta.cum(deltaProxy)
+cvdUp = deltaFast > deltaSlow
+cvdDown = deltaFast < deltaSlow
+deltaUp = deltaProxy > 0
+deltaDown = deltaProxy < 0
+possibleAbsorption = effortHigh and not resultHigh
+
+// ---------- ACCEPTANCE ----------
+barScoreUp = (breakoutUp ? 2 : 0) + (breakoutUp and strongBody ? 1 : 0) + (breakoutUp and resultHigh ? 1 : 0) + (breakoutUp and deltaUp ? 2 : 0) + (breakoutUp and cvdUp ? 2 : 0) + (breakoutUp and effortHigh ? 1 : 0) - (breakoutUp and possibleAbsorption ? 3 : 0)
+barScoreDown = (breakoutDown ? 2 : 0) + (breakoutDown and strongBody ? 1 : 0) + (breakoutDown and resultHigh ? 1 : 0) + (breakoutDown and deltaDown ? 2 : 0) + (breakoutDown and cvdDown ? 2 : 0) + (breakoutDown and effortHigh ? 1 : 0) - (breakoutDown and possibleAbsorption ? 3 : 0)
+var int upAcceptanceBars = 0
+var int downAcceptanceBars = 0
+var float upScore = 0.0
+var float downScore = 0.0
+upAcceptanceBars := breakoutUp ? upAcceptanceBars + 1 : 0
+downAcceptanceBars := breakoutDown ? downAcceptanceBars + 1 : 0
+upScore := breakoutUp ? upScore + math.max(0, barScoreUp) : 0
+downScore := breakoutDown ? downScore + math.max(0, barScoreDown) : 0
+confirmedUp = upAcceptanceBars >= acceptBarsRequired
+confirmedDown = downAcceptanceBars >= acceptBarsRequired
+newAcceptUp = confirmedUp and not confirmedUp[1]
+newAcceptDown = confirmedDown and not confirmedDown[1]
+acceptanceScore = confirmedUp ? math.min(10.0, upScore) : confirmedDown ? math.min(10.0, downScore) : math.min(10.0, math.max(upScore, downScore))
+
+// ---------- LIFECYCLE ----------
+const int NONE = 0
+const int WAIT_RETEST = 1
+const int RETEST_WEAK = 2
+const int RETEST_HOLD = 3
+const int BREACH_WARNING = 4
+const int RECLAIM_CONFIRMED = 5
+const int RETEST_FAIL = 6
+const int RETEST_EXPIRED = 7
+
+var int state = NONE
+var int direction = 0
+var float acceptedLevel = na
+var int acceptanceIndex = na
+var int stateIndex = na
+var int breachCount = 0
+var int reclaimCount = 0
+var int setupId = 0
+var bool setupActive = false
+
+// ---------- SNAPSHOTS ----------
+var float acceptanceDeltaSnap = na
+var int acceptanceCvdSnap = 0
+var float acceptanceResultSnap = na
+var float acceptanceEffortSnap = na
+var bool acceptanceAbsorptionSnap = false
+var float acceptanceScoreSnap = na
+var int acceptanceSnapshotBar = na
+var float retestDeltaSnap = na
+var int retestCvdSnap = 0
+var float retestResultSnap = na
+var float retestEffortSnap = na
+var bool retestAbsorptionSnap = false
+var float retestScoreSnap = na
+var int retestSnapshotBar = na
+
+var int archivedSetupId = 0
+var int archivedFinalState = NONE
+
+if newAcceptUp or newAcceptDown
+    if setupActive
+        archivedSetupId := setupId
+        archivedFinalState := state
+    setupId += 1
+    direction := newAcceptUp ? 1 : -1
+    acceptedLevel := newAcceptUp ? rangeHigh : rangeLow
+    acceptanceIndex := bar_index
+    stateIndex := bar_index
+    state := WAIT_RETEST
+    setupActive := true
+    breachCount := 0
+    reclaimCount := 0
+    acceptanceDeltaSnap := deltaProxy
+    acceptanceCvdSnap := cvdUp ? 1 : cvdDown ? -1 : 0
+    acceptanceResultSnap := resultMagnitude / math.max(atr, syminfo.mintick)
+    acceptanceEffortSnap := volume / math.max(volumeAvg, 1.0)
+    acceptanceAbsorptionSnap := possibleAbsorption
+    acceptanceScoreSnap := math.min(10.0, acceptanceScore)
+    acceptanceSnapshotBar := bar_index
+    retestDeltaSnap := na
+    retestCvdSnap := 0
+    retestResultSnap := na
+    retestEffortSnap := na
+    retestAbsorptionSnap := false
+    retestScoreSnap := na
+    retestSnapshotBar := na
+
+hasSetup = setupActive and not na(acceptedLevel) and not na(acceptanceIndex)
+barsSinceAcceptance = hasSetup ? bar_index - acceptanceIndex : 0
+stateAge = hasSetup and not na(stateIndex) ? bar_index - stateIndex : 0
+
+// ---------- RETEST ----------
+waitLike = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK)
+retestTouchUp = waitLike and direction == 1 and low <= acceptedLevel and close >= acceptedLevel
+retestTouchDown = waitLike and direction == -1 and high >= acceptedLevel and close <= acceptedLevel
+retestDeltaUp = deltaProxy >= retestDeltaMin
+retestDeltaDown = deltaProxy <= -retestDeltaMin
+retestReactionUp = close > open and close >= close[1]
+retestReactionDown = close < open and close <= close[1]
+retestHighEffortLowResult = effortHigh and not retestResultHigh
+retestHoldUp = retestTouchUp and retestReactionUp and retestResultHigh and retestDeltaUp and cvdUp and not retestHighEffortLowResult and not possibleAbsorption
+retestHoldDown = retestTouchDown and retestReactionDown and retestResultHigh and retestDeltaDown and cvdDown and not retestHighEffortLowResult and not possibleAbsorption
+retestTouched = retestTouchUp or retestTouchDown
+retestWeakNow = retestTouched and not (retestHoldUp or retestHoldDown)
+
+if retestTouched and na(retestSnapshotBar)
+    retestDeltaSnap := deltaProxy
+    retestCvdSnap := cvdUp ? 1 : cvdDown ? -1 : 0
+    retestResultSnap := resultMagnitude / math.max(atr, syminfo.mintick)
+    retestEffortSnap := volume / math.max(volumeAvg, 1.0)
+    retestAbsorptionSnap := possibleAbsorption
+    retestScoreSnap := math.min(10.0, math.max(0.0, (direction == 1 and retestDeltaUp or direction == -1 and retestDeltaDown ? 2 : 0) + (direction == 1 and cvdUp or direction == -1 and cvdDown ? 2 : 0) + (retestResultHigh ? 2 : 0) + (effortHigh and retestResultHigh ? 1 : 0) + (not possibleAbsorption ? 1 : 0)))
+    retestSnapshotBar := bar_index
+
+if hasSetup and waitLike and barsSinceAcceptance >= retestWindowBars and not retestTouched
+    archivedSetupId := setupId
+    archivedFinalState := RETEST_EXPIRED
+    setupActive := false
+    state := RETEST_EXPIRED
+    stateIndex := bar_index
+    breachCount := 0
+    reclaimCount := 0
+
+if hasSetup and waitLike and (retestHoldUp or retestHoldDown)
+    state := RETEST_HOLD
+    stateIndex := bar_index
+    breachCount := 0
+    reclaimCount := 0
+else if hasSetup and waitLike and retestWeakNow
+    if state != RETEST_WEAK
+        stateIndex := bar_index
+    state := RETEST_WEAK
+
+// ---------- BREACH / RECLAIM ----------
+breachUp = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK or state == RETEST_HOLD or state == BREACH_WARNING or state == RECLAIM_CONFIRMED) and direction == 1 and close < acceptedLevel
+breachDown = hasSetup and (state == WAIT_RETEST or state == RETEST_WEAK or state == RETEST_HOLD or state == BREACH_WARNING or state == RECLAIM_CONFIRMED) and direction == -1 and close > acceptedLevel
+breachNow = breachUp or breachDown
+if hasSetup and breachNow
+    breachCount += 1
+    state := BREACH_WARNING
+    stateIndex := bar_index
+    reclaimCount := 0
+else if hasSetup and state == BREACH_WARNING and not breachNow
+    reclaimUp = direction == 1 and close >= acceptedLevel
+    reclaimDown = direction == -1 and close <= acceptedLevel
+    if reclaimUp or reclaimDown
+        reclaimCount += 1
+        if reclaimCount >= reclaimBarsRequired
+            state := RECLAIM_CONFIRMED
+            stateIndex := bar_index
+            breachCount := 0
+    else
+        reclaimCount := 0
+
+if hasSetup and state == BREACH_WARNING and breachCount >= failureBarsRequired
+    state := RETEST_FAIL
+    stateIndex := bar_index
+    setupActive := false
+
+// ---------- SNAPSHOT COMPARISON ----------
+retestScoreAvailable = not na(retestScoreSnap)
+float comparisonDelta = na
+float comparisonCvd = na
+float comparisonResult = na
+float comparisonEffort = na
+bool cvdComparisonConflict = false
+bool deltaComparisonConflict = false
+bool resultComparisonConflict = false
+bool absorptionComparisonConflict = false
+if retestScoreAvailable
+    comparisonDelta := na(acceptanceDeltaSnap) or na(retestDeltaSnap) ? na : math.sign(acceptanceDeltaSnap) == math.sign(retestDeltaSnap) ? 0 : 1
+    comparisonCvd := acceptanceCvdSnap == retestCvdSnap ? 0 : 1
+    comparisonResult := na(acceptanceResultSnap) or na(retestResultSnap) ? na : retestResultSnap < acceptanceResultSnap ? 1 : 0
+    comparisonEffort := na(acceptanceEffortSnap) or na(retestEffortSnap) ? na : retestEffortSnap < acceptanceEffortSnap ? 1 : 0
+    cvdComparisonConflict := acceptanceCvdSnap != 0 and retestCvdSnap != 0 and acceptanceCvdSnap != retestCvdSnap
+    deltaComparisonConflict := not na(acceptanceDeltaSnap) and not na(retestDeltaSnap) and math.sign(acceptanceDeltaSnap) != math.sign(retestDeltaSnap)
+    resultComparisonConflict := not na(acceptanceResultSnap) and not na(retestResultSnap) and retestResultSnap < acceptanceResultSnap
+    absorptionComparisonConflict := retestAbsorptionSnap and not acceptanceAbsorptionSnap
+comparisonWeakCount = (cvdComparisonConflict ? 1 : 0) + (deltaComparisonConflict ? 1 : 0) + (resultComparisonConflict ? 1 : 0) + (absorptionComparisonConflict ? 1 : 0)
+evidenceTrend = not retestScoreAvailable ? "AWAITING" : comparisonWeakCount >= 2 ? "WEAKENING" : retestScoreSnap > acceptanceScoreSnap ? "STRENGTHENING" : math.abs(retestScoreSnap - acceptanceScoreSnap) < 1 ? "STABLE" : "WEAKENING"
+
+// ---------- DECISION ENGINE ----------
+const int DEC_WAIT = 0
+const int DEC_LONG = 1
+const int DEC_SHORT = -1
+const int DEC_INVALID = 2
+const int DEC_CONFLICT = 3
+
+acceptanceGateLong = confirmedUp and direction == 1
+acceptanceGateShort = confirmedDown and direction == -1
+retestGateLong = state == RETEST_HOLD and direction == 1
+retestGateShort = state == RETEST_HOLD and direction == -1
+evidenceGateLong = direction == 1 and (not retestScoreAvailable or retestScoreSnap >= 5)
+evidenceGateShort = direction == -1 and (not retestScoreAvailable or retestScoreSnap >= 5)
+conflictCount = comparisonWeakCount + (persistentConflict ? 1 : 0)
+conflictGate = conflictCount <= conflictThreshold
+contextGate = context != "BALANCE"
+
+var int decisionState = DEC_WAIT
+var int decisionStateIndex = na
+var int candidateDirection = 0
+var int candidateBars = 0
+var int conflictBars = 0
+var int invalidationCandidateCount = 0
+var bool invalidationCandidateConfirmed = false
+var int recoveryBars = 0
+var bool recoveryConfirmed = false
+var int decisionSnapshotSetupId = 0
+var int decisionSnapshotBar = na
+var int decisionSnapshotDirection = 0
+var float decisionSnapshotScore = na
+var string decisionSnapshotQuality = "LOW"
+var string decisionSnapshotConfidence = "LOW"
+var string decisionSnapshotHealth = "INVALID"
+
+longCandidate = acceptanceGateLong and retestGateLong and evidenceGateLong and conflictGate and contextGate
+shortCandidate = acceptanceGateShort and retestGateShort and evidenceGateShort and conflictGate and contextGate
+
+if longCandidate
+    if candidateDirection != 1
+        candidateDirection := 1
+        candidateBars := 1
+    else
+        candidateBars += 1
+else if shortCandidate
+    if candidateDirection != -1
+        candidateDirection := -1
+        candidateBars := 1
+    else
+        candidateBars += 1
+else
+    candidateDirection := 0
+    candidateBars := 0
+
+if candidateDirection == 1 and candidateBars >= biasConfirmBars
+    decisionState := DEC_LONG
+    if decisionStateIndex == na
+        decisionStateIndex := bar_index
+if candidateDirection == -1 and candidateBars >= biasConfirmBars
+    decisionState := DEC_SHORT
+    if decisionStateIndex == na
+        decisionStateIndex := bar_index
+
+if decisionState == DEC_LONG or decisionState == DEC_SHORT
+    if not conflictGate or not contextGate or (decisionState == DEC_LONG and not acceptanceGateLong) or (decisionState == DEC_SHORT and not acceptanceGateShort)
+        conflictBars += 1
+    else
+        conflictBars := 0
+else
+    conflictBars := 0
+
+persistentConflict = conflictBars >= conflictPersistenceBars
+
+if decisionState == DEC_LONG or decisionState == DEC_SHORT
+    invalidationNow = (decisionState == DEC_LONG and breachNow) or (decisionState == DEC_SHORT and breachNow) or persistentConflict
+    if invalidationNow
+        invalidationCandidateCount += 1
+    else
+        invalidationCandidateCount := 0
+    invalidationCandidateConfirmed := invalidationCandidateCount >= invalidationCandidateBars
+    if invalidationCandidateConfirmed
+        decisionState := DEC_INVALID
+        decisionStateIndex := bar_index
+        invalidationCandidateCount := 0
+        recoveryBars := 0
+        recoveryConfirmed := false
+else
+    invalidationCandidateCount := 0
+    invalidationCandidateConfirmed := false
+
+if decisionState == DEC_INVALID
+    if (direction == 1 and longCandidate) or (direction == -1 and shortCandidate)
+        recoveryBars += 1
+    else
+        recoveryBars := 0
+    recoveryConfirmed := recoveryBars >= recoveryConfirmBars
+    if recoveryConfirmed
+        decisionState := direction == 1 ? DEC_LONG : DEC_SHORT
+        decisionStateIndex := bar_index
+        invalidationCandidateConfirmed := false
+        invalidationCandidateCount := 0
+
+// ---------- DECISION SNAPSHOT ----------
+confluenceScore = (acceptanceScoreSnap * 0.5) + (na(retestScoreSnap) ? 0 : retestScoreSnap * 0.5)
+confluenceScoreClamped = math.min(10.0, math.max(0.0, confluenceScore))
+decisionQuality = confluenceScoreClamped >= 7 ? "HIGH" : confluenceScoreClamped >= 5 ? "MEDIUM" : "LOW"
+decisionConfidence = (conflictGate and contextGate and (decisionState == DEC_LONG or decisionState == DEC_SHORT)) ? (confluenceScoreClamped >= 7 ? "HIGH" : "MEDIUM") : "LOW"
+healthText = decisionState == DEC_INVALID ? "INVALID" : persistentConflict ? "DETERIORATING" : evidenceTrend == "STRENGTHENING" ? "HEALTHY" : evidenceTrend == "WEAKENING" ? "CAUTION" : "HEALTHY"
+decisionTrend = evidenceTrend
+
+newDecision = (decisionState == DEC_LONG or decisionState == DEC_SHORT) and decisionState != decisionState[1]
+if newDecision
+    decisionSnapshotSetupId := setupId
+    decisionSnapshotBar := bar_index
+    decisionSnapshotDirection := decisionState == DEC_LONG ? 1 : -1
+    decisionSnapshotScore := confluenceScoreClamped
+    decisionSnapshotQuality := decisionQuality
+    decisionSnapshotConfidence := decisionConfidence
+    decisionSnapshotHealth := healthText
+
+decisionAge = na(decisionSnapshotBar) ? 0 : bar_index - decisionSnapshotBar
+currentDecisionEvidenceScore = confluenceScoreClamped
+scoreDrift = na(decisionSnapshotScore) ? 0 : currentDecisionEvidenceScore - decisionSnapshotScore
+decisionDrift = scoreDrift > 1 ? "POSITIVE" : scoreDrift < -1 ? "NEGATIVE" : "STABLE"
+
+// ---------- OUTCOME TRACKING ----------
+var bool outcomeActive = false
+var int outcomeSetupId = 0
+var int outcomeDirection = 0
+var int outcomeStartBar = na
+var float outcomeReferencePrice = na
+var float outcomeReferenceATR = na
+var float outcomeH1 = na
+var float outcomeH3 = na
+var float outcomeH5 = na
+var float outcomeH10 = na
+var float outcomeH20 = na
+var float mfeSignedATR = na
+var float maeSignedATR = na
+var string outcomeClassText = "PENDING"
+var string validation = "PENDING"
+var string timingQuality = "PENDING"
+var int firstFavorableBar = na
+var int firstAdverseBar = na
+var string outcomeH1Class = "PENDING"
+var string outcomeH3Class = "PENDING"
+var string outcomeH5Class = "PENDING"
+var string outcomeH10Class = "PENDING"
+var string outcomeH20Class = "PENDING"
+
+var outcomeArchiveSetupIds = array.new_int()
+var outcomeArchiveDirections = array.new_int()
+var outcomeArchiveDecisions = array.new_string()
+var outcomeArchiveQualities = array.new_string()
+var outcomeArchiveConfidences = array.new_string()
+var outcomeArchiveHealths = array.new_string()
+var outcomeArchiveH1 = array.new_float()
+var outcomeArchiveH3 = array.new_float()
+var outcomeArchiveH5 = array.new_float()
+var outcomeArchiveH10 = array.new_float()
+var outcomeArchiveH20 = array.new_float()
+var outcomeArchiveMfe = array.new_float()
+var outcomeArchiveMae = array.new_float()
+var outcomeArchiveValidation = array.new_string()
+var outcomeArchiveTiming = array.new_string()
+var outcomeArchiveBars = array.new_int()
+
+archiveOutcome() =>
+    if outcomeActive and not na(outcomeStartBar)
+        array.push(outcomeArchiveSetupIds, outcomeSetupId)
+        array.push(outcomeArchiveDirections, outcomeDirection)
+        array.push(outcomeArchiveDecisions, outcomeDirection == 1 ? "LONG" : "SHORT")
+        array.push(outcomeArchiveQualities, decisionSnapshotQuality)
+        array.push(outcomeArchiveConfidences, decisionSnapshotConfidence)
+        array.push(outcomeArchiveHealths, decisionSnapshotHealth)
+        array.push(outcomeArchiveH1, outcomeH1)
+        array.push(outcomeArchiveH3, outcomeH3)
+        array.push(outcomeArchiveH5, outcomeH5)
+        array.push(outcomeArchiveH10, outcomeH10)
+        array.push(outcomeArchiveH20, outcomeH20)
+        array.push(outcomeArchiveMfe, mfeSignedATR)
+        array.push(outcomeArchiveMae, maeSignedATR)
+        array.push(outcomeArchiveValidation, validation)
+        array.push(outcomeArchiveTiming, timingQuality)
+        array.push(outcomeArchiveBars, bar_index - outcomeStartBar)
+        while array.size(outcomeArchiveSetupIds) > maxOutcomeArchiveRecords
+            array.shift(outcomeArchiveSetupIds)
+            array.shift(outcomeArchiveDirections)
+            array.shift(outcomeArchiveDecisions)
+            array.shift(outcomeArchiveQualities)
+            array.shift(outcomeArchiveConfidences)
+            array.shift(outcomeArchiveHealths)
+            array.shift(outcomeArchiveH1)
+            array.shift(outcomeArchiveH3)
+            array.shift(outcomeArchiveH5)
+            array.shift(outcomeArchiveH10)
+            array.shift(outcomeArchiveH20)
+            array.shift(outcomeArchiveMfe)
+            array.shift(outcomeArchiveMae)
+            array.shift(outcomeArchiveValidation)
+            array.shift(outcomeArchiveTiming)
+            array.shift(outcomeArchiveBars)
+
+newOutcomeDecision = newDecision and (decisionState == DEC_LONG or decisionState == DEC_SHORT)
+if newOutcomeDecision
+    archiveOutcome()
+    outcomeActive := true
+    outcomeSetupId := decisionSnapshotSetupId
+    outcomeDirection := decisionSnapshotDirection
+    outcomeStartBar := bar_index
+    outcomeReferencePrice := close
+    outcomeReferenceATR := math.max(atr, syminfo.mintick)
+    outcomeH1 := na
+    outcomeH3 := na
+    outcomeH5 := na
+    outcomeH10 := na
+    outcomeH20 := na
+    mfeSignedATR := 0.0
+    maeSignedATR := 0.0
+    outcomeClassText := "PENDING"
+    validation := "PENDING"
+    timingQuality := "PENDING"
+    firstFavorableBar := na
+    firstAdverseBar := na
+    outcomeH1Class := "PENDING"
+    outcomeH3Class := "PENDING"
+    outcomeH5Class := "PENDING"
+    outcomeH10Class := "PENDING"
+    outcomeH20Class := "PENDING"
+
+barsFromOutcome = outcomeActive and not na(outcomeStartBar) ? bar_index - outcomeStartBar : na
+favorableMove = outcomeDirection == 1 ? high - outcomeReferencePrice : outcomeReferencePrice - low
+adverseMove = outcomeDirection == 1 ? low - outcomeReferencePrice : outcomeReferencePrice - high
+if outcomeActive and barsFromOutcome >= 1
+    favorableATRNow = favorableMove / outcomeReferenceATR
+    adverseATRNow = adverseMove / outcomeReferenceATR
+    mfeSignedATR := math.max(mfeSignedATR, favorableATRNow)
+    maeSignedATR := math.min(maeSignedATR, adverseATRNow)
+    if na(firstFavorableBar) and favorableATRNow >= outcomeFavorableATR
+        firstFavorableBar := bar_index
+    if na(firstAdverseBar) and adverseATRNow <= -outcomeAdverseATR
+        firstAdverseBar := bar_index
+
+classifyOutcome(v) =>
+    na(v) ? "PENDING" : v >= outcomeFavorableATR ? "FAVORABLE" : v <= -outcomeAdverseATR ? "ADVERSE" : "NEUTRAL"
+
+if outcomeActive
+    if barsFromOutcome == 1
+        outcomeH1 := (outcomeDirection == 1 ? close - outcomeReferencePrice : outcomeReferencePrice - close) / outcomeReferenceATR
+        outcomeH1Class := classifyOutcome(outcomeH1)
+    if barsFromOutcome == 3
+        outcomeH3 := (outcomeDirection == 1 ? close - outcomeReferencePrice : outcomeReferencePrice - close) / outcomeReferenceATR
+        outcomeH3Class := classifyOutcome(outcomeH3)
+    if barsFromOutcome == 5
+        outcomeH5 := (outcomeDirection == 1 ? close - outcomeReferencePrice : outcomeReferencePrice - close) / outcomeReferenceATR
+        outcomeH5Class := classifyOutcome(outcomeH5)
+    if barsFromOutcome == 10
+        outcomeH10 := (outcomeDirection == 1 ? close - outcomeReferencePrice : outcomeReferencePrice - close) / outcomeReferenceATR
+        outcomeH10Class := classifyOutcome(outcomeH10)
+    if barsFromOutcome == 20
+        outcomeH20 := (outcomeDirection == 1 ? close - outcomeReferencePrice : outcomeReferencePrice - close) / outcomeReferenceATR
+        outcomeH20Class := classifyOutcome(outcomeH20)
+
+validationValue = outcomeValidationHorizon == 1 ? outcomeH1 : outcomeValidationHorizon == 3 ? outcomeH3 : outcomeValidationHorizon == 5 ? outcomeH5 : outcomeValidationHorizon == 10 ? outcomeH10 : outcomeH20
+if outcomeActive and barsFromOutcome >= outcomeValidationHorizon and not na(validationValue)
+    validation := validationValue >= outcomeFavorableATR ? "VALIDATED" : validationValue <= -outcomeAdverseATR ? "FAILED" : "NEUTRAL"
+    outcomeClassText := validationValue >= outcomeFavorableATR ? "FAVORABLE" : validationValue <= -outcomeAdverseATR ? "ADVERSE" : "NEUTRAL"
+    timingQuality := not na(firstFavorableBar) ? (firstFavorableBar - outcomeStartBar <= 1 ? "FAST" : firstFavorableBar - outcomeStartBar <= 5 ? "NORMAL" : "SLOW") : validation == "FAILED" ? "FAILED" : "PENDING"
+    if barsFromOutcome >= outcomeValidationHorizon
+        archiveOutcome()
+        outcomeActive := false
+
+// ---------- PERFORMANCE ANALYTICS ----------
+var int totalValidated = 0
+var int totalFailed = 0
+var int totalNeutral = 0
+
+calcRate(_total, _wins) =>
+    _total > 0 ? (_wins * 100.0 / _total) : na
+
+archiveCount = array.size(outcomeArchiveSetupIds)
+if barstate.islast
+    totalValidated := 0
+    totalFailed := 0
+    totalNeutral := 0
+    if archiveCount > 0
+        for i = 0 to archiveCount - 1
+            v = array.get(outcomeArchiveValidation, i)
+            totalValidated += v == "VALIDATED" ? 1 : 0
+            totalFailed += v == "FAILED" ? 1 : 0
+            totalNeutral += v == "NEUTRAL" ? 1 : 0
+
+totalOutcomes = totalValidated + totalFailed + totalNeutral
+validationRate = calcRate(totalOutcomes, totalValidated)
+failureRate = calcRate(totalOutcomes, totalFailed)
+
+// ---------- QUALITY / CONFIDENCE / HEALTH ANALYTICS ----------
+countByString(_arr, _value) =>
+    int c = 0
+    n = array.size(_arr)
+    if n > 0
+        for i = 0 to n - 1
+            c += array.get(_arr, i) == _value ? 1 : 0
+    c
+
+validatedByString(_classArr, _value, _validationArr) =>
+    int c = 0
+    int w = 0
+    n = array.size(_classArr)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(_classArr, i) == _value
+                c += 1
+                w += array.get(_validationArr, i) == "VALIDATED" ? 1 : 0
+    [c, w]
+
+[highQCount, highQValidated] = validatedByString(outcomeArchiveQualities, "HIGH", outcomeArchiveValidation)
+[medQCount, medQValidated] = validatedByString(outcomeArchiveQualities, "MEDIUM", outcomeArchiveValidation)
+[lowQCount, lowQValidated] = validatedByString(outcomeArchiveQualities, "LOW", outcomeArchiveValidation)
+[highCCount, highCValidated] = validatedByString(outcomeArchiveConfidences, "HIGH", outcomeArchiveValidation)
+[medCCount, medCValidated] = validatedByString(outcomeArchiveConfidences, "MEDIUM", outcomeArchiveValidation)
+[lowCCount, lowCValidated] = validatedByString(outcomeArchiveConfidences, "LOW", outcomeArchiveValidation)
+[healthyCount, healthyValidated] = validatedByString(outcomeArchiveHealths, "HEALTHY", outcomeArchiveValidation)
+[cautionCount, cautionValidated] = validatedByString(outcomeArchiveHealths, "CAUTION", outcomeArchiveValidation)
+[deterioratingCount, deterioratingValidated] = validatedByString(outcomeArchiveHealths, "DETERIORATING", outcomeArchiveValidation)
+[invalidCount, invalidValidated] = validatedByString(outcomeArchiveHealths, "INVALID", outcomeArchiveValidation)
+
+// ---------- PATTERN ANALYTICS ----------
+var int patternDeltaCvdCount = 0
+var int patternDeltaCvdValidated = 0
+var int patternAbsorptionCount = 0
+var int patternAbsorptionValidated = 0
+if barstate.islast
+    patternDeltaCvdCount := 0
+    patternDeltaCvdValidated := 0
+    patternAbsorptionCount := 0
+    patternAbsorptionValidated := 0
+    if archiveCount > 0
+        for i = 0 to archiveCount - 1
+            // Archive-level pattern fields are intentionally represented by the
+            // Decision quality/outcome records available in v1.0. Evidence-level
+            // research remains observational and does not modify weights.
+            q = array.get(outcomeArchiveQualities, i)
+            v = array.get(outcomeArchiveValidation, i)
+            if q == "HIGH"
+                patternDeltaCvdCount += 1
+                patternDeltaCvdValidated += v == "VALIDATED" ? 1 : 0
+            if q == "LOW"
+                patternAbsorptionCount += 1
+                patternAbsorptionValidated += v == "VALIDATED" ? 1 : 0
+
+// ---------- PANEL ----------
+var table panel = table.new(position.top_right, 2, 50, border_width=1)
+
+formatPct(v) => na(v) ? "—" : str.tostring(v, "#.0") + "%"
+
+stateText = state == WAIT_RETEST ? "WAIT RETEST" : state == RETEST_WEAK ? "RETEST WEAK" : state == RETEST_HOLD ? "RETEST HOLD" : state == BREACH_WARNING ? "BREACH WARNING" : state == RECLAIM_CONFIRMED ? "RECLAIM" : state == RETEST_FAIL ? "FAIL" : state == RETEST_EXPIRED ? "EXPIRED" : "NONE"
+decisionText = decisionState == DEC_LONG ? "LONG BIAS" : decisionState == DEC_SHORT ? "SHORT BIAS" : decisionState == DEC_INVALID ? "INVALIDATED" : decisionState == DEC_CONFLICT ? "CONFLICT" : "WAIT"
+reason = decisionState == DEC_LONG ? "Acceptance + Retest + Evidence aligned" : decisionState == DEC_SHORT ? "Acceptance + Retest + Evidence aligned" : decisionState == DEC_INVALID ? "Persistent invalidation evidence" : "Decision gates not satisfied"
+invalidationReason = invalidationCandidateConfirmed or decisionState == DEC_INVALID ? "Candidate persistence confirmed" : "No confirmed invalidation"
+
+if barstate.islast and showPanel
+    table.clear(panel, 0, 0, 1, 49)
+    table.cell(panel, 0, 0, "AUCTION AI v1.0", text_size=textSize)
+    table.cell(panel, 1, 0, "PERFORMANCE", text_size=textSize)
+    table.cell(panel, 0, 1, "Context", text_size=textSize)
+    table.cell(panel, 1, 1, context + " / " + locationText, text_size=textSize)
+    table.cell(panel, 0, 2, "Setup", text_size=textSize)
+    table.cell(panel, 1, 2, setupActive ? "#" + str.tostring(setupId) : "NONE", text_size=textSize)
+    table.cell(panel, 0, 3, "State", text_size=textSize)
+    table.cell(panel, 1, 3, stateText, text_size=textSize)
+    table.cell(panel, 0, 4, "Acceptance", text_size=textSize)
+    table.cell(panel, 1, 4, str.tostring(acceptanceScoreSnap, "#.0") + " / 10", text_size=textSize)
+    table.cell(panel, 0, 5, "Retest", text_size=textSize)
+    table.cell(panel, 1, 5, retestScoreAvailable ? str.tostring(retestScoreSnap, "#.0") + " / 10" : "AWAITING", text_size=textSize)
+    table.cell(panel, 0, 6, "Evidence", text_size=textSize)
+    table.cell(panel, 1, 6, evidenceTrend, text_size=textSize)
+    table.cell(panel, 0, 7, "Conflict", text_size=textSize)
+    table.cell(panel, 1, 7, str.tostring(conflictCount) + (persistentConflict ? " / PERSISTENT" : ""), text_size=textSize)
+    table.cell(panel, 0, 8, "Confluence", text_size=textSize)
+    table.cell(panel, 1, 8, str.tostring(confluenceScoreClamped) + " / 10", text_size=textSize)
+    table.cell(panel, 0, 9, "Decision", text_size=textSize)
+    table.cell(panel, 1, 9, decisionText, text_size=textSize)
+    table.cell(panel, 0, 10, "Quality", text_size=textSize)
+    table.cell(panel, 1, 10, decisionQuality, text_size=textSize)
+    table.cell(panel, 0, 11, "Confidence", text_size=textSize)
+    table.cell(panel, 1, 11, decisionConfidence, text_size=textSize)
+    table.cell(panel, 0, 12, "Health", text_size=textSize)
+    table.cell(panel, 1, 12, healthText, text_size=textSize)
+    table.cell(panel, 0, 13, "Trend / Drift", text_size=textSize)
+    table.cell(panel, 1, 13, decisionTrend + " / " + decisionDrift, text_size=textSize)
+    table.cell(panel, 0, 14, "Decision Age", text_size=textSize)
+    table.cell(panel, 1, 14, str.tostring(decisionAge) + " bars", text_size=textSize)
+    table.cell(panel, 0, 15, "Outcome", text_size=textSize)
+    table.cell(panel, 1, 15, outcomeClassText, text_size=textSize)
+    table.cell(panel, 0, 16, "Validation", text_size=textSize)
+    table.cell(panel, 1, 16, validation, text_size=textSize)
+    table.cell(panel, 0, 17, "Timing", text_size=textSize)
+    table.cell(panel, 1, 17, timingQuality, text_size=textSize)
+    table.cell(panel, 0, 18, "MFE / MAE", text_size=textSize)
+    table.cell(panel, 1, 18, outcomeActive ? str.tostring(mfeSignedATR, "#.##") + " / " + str.tostring(maeSignedATR, "#.##") + " ATR" : "—", text_size=textSize)
+    table.cell(panel, 0, 19, "H1 / H3", text_size=textSize)
+    table.cell(panel, 1, 19, outcomeActive ? str.tostring(outcomeH1, "#.##") + " / " + str.tostring(outcomeH3, "#.##") : "— / —", text_size=textSize)
+    table.cell(panel, 0, 20, "H5 / H10", text_size=textSize)
+    table.cell(panel, 1, 20, outcomeActive ? str.tostring(outcomeH5, "#.##") + " / " + str.tostring(outcomeH10, "#.##") : "— / —", text_size=textSize)
+    table.cell(panel, 0, 21, "H20", text_size=textSize)
+    table.cell(panel, 1, 21, outcomeActive ? str.tostring(outcomeH20, "#.##") : "—", text_size=textSize)
+    table.cell(panel, 0, 22, "Reason", text_size=textSize)
+    table.cell(panel, 1, 22, reason, text_size=textSize)
+    table.cell(panel, 0, 23, "Invalidation", text_size=textSize)
+    table.cell(panel, 1, 23, invalidationReason, text_size=textSize)
+    if showDiagnostics
+        table.cell(panel, 0, 24, "Outcome Setup", text_size=textSize)
+        table.cell(panel, 1, 24, outcomeActive ? "#" + str.tostring(outcomeSetupId) : "NONE", text_size=textSize)
+        table.cell(panel, 0, 25, "Outcome Age", text_size=textSize)
+        table.cell(panel, 1, 25, outcomeActive ? str.tostring(barsFromOutcome) + " bars" : "—", text_size=textSize)
+        table.cell(panel, 0, 26, "Reference", text_size=textSize)
+        table.cell(panel, 1, 26, outcomeActive ? str.tostring(outcomeReferencePrice, format.mintick) : "—", text_size=textSize)
+        table.cell(panel, 0, 27, "H1", text_size=textSize)
+        table.cell(panel, 1, 27, outcomeH1Class, text_size=textSize)
+        table.cell(panel, 0, 28, "H3", text_size=textSize)
+        table.cell(panel, 1, 28, outcomeH3Class, text_size=textSize)
+        table.cell(panel, 0, 29, "H5", text_size=textSize)
+        table.cell(panel, 1, 29, outcomeH5Class, text_size=textSize)
+        table.cell(panel, 0, 30, "H10", text_size=textSize)
+        table.cell(panel, 1, 30, outcomeH10Class, text_size=textSize)
+        table.cell(panel, 0, 31, "H20", text_size=textSize)
+        table.cell(panel, 1, 31, outcomeH20Class, text_size=textSize)
+        table.cell(panel, 0, 32, "First Favorable", text_size=textSize)
+        table.cell(panel, 1, 32, na(firstFavorableBar) ? "—" : str.tostring(firstFavorableBar - outcomeStartBar) + " bars", text_size=textSize)
+        table.cell(panel, 0, 33, "First Adverse", text_size=textSize)
+        table.cell(panel, 1, 33, na(firstAdverseBar) ? "—" : str.tostring(firstAdverseBar - outcomeStartBar) + " bars", text_size=textSize)
+        table.cell(panel, 0, 34, "Acceptance Gate", text_size=textSize)
+        table.cell(panel, 1, 34, (acceptanceGateLong or acceptanceGateShort) ? "PASS" : "FAIL", text_size=textSize)
+        table.cell(panel, 0, 35, "Retest Gate", text_size=textSize)
+        table.cell(panel, 1, 35, (retestGateLong or retestGateShort) ? "PASS" : "FAIL", text_size=textSize)
+        table.cell(panel, 0, 36, "Evidence Gate", text_size=textSize)
+        table.cell(panel, 1, 36, (evidenceGateLong or evidenceGateShort) ? "PASS" : "FAIL", text_size=textSize)
+        table.cell(panel, 0, 37, "Conflict Gate", text_size=textSize)
+        table.cell(panel, 1, 37, conflictGate ? "PASS" : "FAIL", text_size=textSize)
+        table.cell(panel, 0, 38, "Context Gate", text_size=textSize)
+        table.cell(panel, 1, 38, contextGate ? "PASS" : "FAIL", text_size=textSize)
+        table.cell(panel, 0, 39, "Candidate", text_size=textSize)
+        table.cell(panel, 1, 39, candidateDirection == 1 ? "LONG" : candidateDirection == -1 ? "SHORT" : "NONE", text_size=textSize)
+        table.cell(panel, 0, 40, "Candidate Age", text_size=textSize)
+        table.cell(panel, 1, 40, str.tostring(candidateBars) + " / " + str.tostring(biasConfirmBars), text_size=textSize)
+        table.cell(panel, 0, 41, "Conflict Age", text_size=textSize)
+        table.cell(panel, 1, 41, str.tostring(conflictBars) + " / " + str.tostring(conflictPersistenceBars), text_size=textSize)
+        table.cell(panel, 0, 42, "Invalid Candidate", text_size=textSize)
+        table.cell(panel, 1, 42, str.tostring(invalidationCandidateCount) + " / " + str.tostring(invalidationCandidateBars), text_size=textSize)
+        table.cell(panel, 0, 43, "Recovery", text_size=textSize)
+        table.cell(panel, 1, 43, str.tostring(recoveryBars) + " / " + str.tostring(recoveryConfirmBars), text_size=textSize)
+        table.cell(panel, 0, 44, "Decision Snapshot", text_size=textSize)
+        table.cell(panel, 1, 44, na(decisionSnapshotBar) ? "NONE" : "SETUP #" + str.tostring(decisionSnapshotSetupId) + " / BAR " + str.tostring(decisionSnapshotBar), text_size=textSize)
+        table.cell(panel, 0, 45, "Outcome Horizon", text_size=textSize)
+        table.cell(panel, 1, 45, "H" + str.tostring(outcomeValidationHorizon), text_size=textSize)
+        table.cell(panel, 0, 46, "Outcome Thresholds", text_size=textSize)
+        table.cell(panel, 1, 46, "+" + str.tostring(outcomeFavorableATR, "#.##") + " / -" + str.tostring(outcomeAdverseATR, "#.##") + " ATR", text_size=textSize)
+        table.cell(panel, 0, 47, "Outcome Archive", text_size=textSize)
+        table.cell(panel, 1, 47, str.tostring(array.size(outcomeArchiveSetupIds)) + " records", text_size=textSize)
+        table.cell(panel, 0, 48, "Execution", text_size=textSize)
+        table.cell(panel, 1, 48, "NOT INCLUDED", text_size=textSize)
+
+// ---------- PRICE-SCALE-SAFE VISUALS ----------
+plot(showBalance ? rangeHigh : na, "Balance High")
+plot(showBalance ? rangeLow : na, "Balance Low")
+plot(showAcceptedLevel and activeStructure ? acceptedLevel : na, "Accepted Level")
+plotshape(showSignals and newAcceptUp, title="Acceptance Up", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="A↑")
+plotshape(showSignals and newAcceptDown, title="Acceptance Down", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="A↓")
+plotshape(showSignals and state == RETEST_HOLD and state[1] != RETEST_HOLD, title="Retest Hold", style=shape.circle, location=location.belowbar, size=size.tiny, text="H")
+plotshape(showSignals and state == RETEST_WEAK and state[1] != RETEST_WEAK, title="Retest Weak", style=shape.diamond, location=location.abovebar, size=size.tiny, text="W")
+plotshape(showSignals and state == BREACH_WARNING and state[1] != BREACH_WARNING, title="Breach Warning", style=shape.xcross, location=location.abovebar, size=size.tiny, text="B")
+plotshape(showSignals and state == RECLAIM_CONFIRMED and state[1] != RECLAIM_CONFIRMED, title="Reclaim Confirmed", style=shape.circle, location=location.belowbar, size=size.tiny, text="RC")
+plotshape(showSignals and state == RETEST_FAIL and state[1] != RETEST_FAIL, title="Retest Fail", style=shape.xcross, location=location.abovebar, size=size.tiny, text="F")
+plotshape(showSignals and decisionState == DEC_LONG and decisionState[1] != DEC_LONG, title="Long Bias", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="LB")
+plotshape(showSignals and decisionState == DEC_SHORT and decisionState[1] != DEC_SHORT, title="Short Bias", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="SB")
+plotshape(showSignals and invalidationCandidateConfirmed and not invalidationCandidateConfirmed[1], title="Invalidation Candidate", style=shape.xcross, location=location.abovebar, size=size.tiny, text="IC")
+plotshape(showSignals and recoveryConfirmed and not recoveryConfirmed[1], title="Decision Recovery", style=shape.circle, location=location.belowbar, size=size.tiny, text="REC")
+plotshape(showSignals and decisionState == DEC_INVALID and decisionState[1] != DEC_INVALID, title="Decision Invalidated", style=shape.xcross, location=location.abovebar, size=size.tiny, text="I")
+
+// Outcome validation marker is deliberately diagnostic only.
+plotshape(showSignals and outcomeActive and barsFromOutcome == outcomeValidationHorizon and validation == "VALIDATED", title="Outcome Validated", style=shape.circle, location=location.belowbar, size=size.tiny, text="V")
+plotshape(showSignals and outcomeActive and barsFromOutcome == outcomeValidationHorizon and validation == "FAILED", title="Outcome Failed", style=shape.xcross, location=location.abovebar, size=size.tiny, text="OF")
