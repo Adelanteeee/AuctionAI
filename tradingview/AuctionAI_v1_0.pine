@@ -1,0 +1,8 @@
+//@version=6
+indicator("AuctionAI v1.0 - Performance & Pattern Analytics", overlay=true)
+
+// v1.0 — Performance Analytics, Pattern Analytics & Outcome Archive
+// Extends v0.9 with read-only analytics over archived Decision Outcomes.
+// No Gate, Decision, threshold, weighting or execution logic is auto-modified.
+// Outcome remains price behavior after a Decision Snapshot — NOT a trade/P&L.
+
