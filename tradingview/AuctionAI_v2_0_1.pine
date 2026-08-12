@@ -5,7 +5,7 @@ indicator("AuctionAI v2.0.1 - Controlled Self-Learning", overlay=true, max_bars_
 // Fixes: rejected-cycle recovery, gate sample minimums, OOS sample minimum,
 // confidence calibration, outcome-aware decision comparison, decision-change
 // outcome analytics, full retest-state analytics, explicit baseline/active labels,
-// and auditable learning-cycle history.
+// auditable learning-cycle history, and candidate de-duplication/fresh-recommendation gating.
 // Stability is intentionally ARCHIVE-BASED, not calendar/regime-period stability.
 // No entry, SL, TP, position sizing, execution or auto-trading.
 
@@ -232,6 +232,15 @@ var int learnedBreakout = 0
 var int learnedAbsorption = 0
 var int lastAppliedCycle = 0
 
+// Candidate de-duplication / freshness state.
+// A candidate may only be created when its recommendation signature is new
+// or the underlying research evidence has materially changed since the last cycle.
+var string lastCandidateEvidence = ""
+var int lastCandidateDelta = na
+var int lastCandidateResearchW = na
+var int lastCandidateResearchN = na
+var bool hasCandidateHistory = false
+
 var bool shadowActive = false
 var int shadowDir = 0
 var int shadowBaseDir = 0
@@ -271,7 +280,17 @@ if barstate.isfirst
 
 // ========================= CANDIDATE CREATION =========================
 requestedDelta = math.max(-maxWeightDelta, math.min(maxWeightDelta, requestedCandidateDelta))
-candidateSupported = N >= researchMinSamples and researchN >= researchMinSamples and not learningPaused and cycleState == "IDLE" and not driftDetected
+currentRecommendationWeight = candidateEvidence == "CVD" ? learnedCvd : candidateEvidence == "Delta" ? learnedDelta : candidateEvidence == "Effort" ? learnedEffort : candidateEvidence == "Result" ? learnedResult : candidateEvidence == "Strong Body" ? learnedBody : candidateEvidence == "Breakout" ? learnedBreakout : learnedAbsorption
+proposedRecommendationWeight = currentRecommendationWeight + requestedDelta
+recommendationValid = requestedDelta != 0 and proposedRecommendationWeight != currentRecommendationWeight
+researchEvidenceChanged = not hasCandidateHistory or researchN != lastCandidateResearchN or baseResearchW != lastCandidateResearchW
+recommendationChanged = not hasCandidateHistory or candidateEvidence != lastCandidateEvidence or requestedDelta != lastCandidateDelta
+freshRecommendation = recommendationValid and (researchEvidenceChanged or recommendationChanged)
+
+// Research data alone is not enough: a candidate requires a valid, fresh
+// recommendation. The same candidate is therefore blocked until research
+// evidence or the recommendation itself changes.
+candidateSupported = N >= researchMinSamples and researchN >= researchMinSamples and not learningPaused and cycleState == "IDLE" and not driftDetected and freshRecommendation
 
 if candidateSupported
     cycleId += 1
@@ -280,8 +299,16 @@ if candidateSupported
     cycleStartBar := bar_index
     cycleEvidence := candidateEvidence
     cycleEvidenceDelta := requestedDelta
-    cycleBaselineWeight := candidateEvidence == "CVD" ? learnedCvd : candidateEvidence == "Delta" ? learnedDelta : candidateEvidence == "Effort" ? learnedEffort : candidateEvidence == "Result" ? learnedResult : candidateEvidence == "Strong Body" ? learnedBody : candidateEvidence == "Breakout" ? learnedBreakout : learnedAbsorption
-    cycleCandidateWeight := cycleBaselineWeight + cycleEvidenceDelta
+    cycleBaselineWeight := currentRecommendationWeight
+    cycleCandidateWeight := proposedRecommendationWeight
+
+    // Freeze the recommendation signature for this cycle.
+    lastCandidateEvidence := candidateEvidence
+    lastCandidateDelta := requestedDelta
+    lastCandidateResearchW := baseResearchW
+    lastCandidateResearchN := researchN
+    hasCandidateHistory := true
+
     shadowCount := 0
     shadowValidated := 0
     shadowLongN := 0
@@ -545,7 +572,6 @@ confidenceCalibrationReady = confLowN >= gateMinSamples and confHighN >= gateMin
 confidenceCalibrationPass = confidenceCalibrationReady and not na(confHighRate) and not na(confLowRate) and confHighRate - confLowRate >= minConfidenceCalibrationLift
 confidencePass = confidenceCalibrationPass
 
-// Outcome-aware direct comparison only uses samples where both engines actually produced a direction.
 directComparisonPass = baseCompareN >= gateMinSamples and not na(improvement) and improvement >= minImprovementPp
 
 allGatesPass = samplePass and oosPass and stabilityPass and driftPass and directionPass and contextPass and retestPass and confidencePass and directComparisonPass
