@@ -1,21 +1,22 @@
 //@version=6
 indicator("AuctionAI v2.2 - Candidate Engine + Adaptive Research", overlay=true, max_bars_back=5000)
 
-// v2.2 = v2.1 Candidate Engine + Research Layer.
-// Research may recommend Candidates, but NEVER changes parameters automatically.
-// Baseline is the permanent control. Exactly ONE challenger Candidate may be in
-// SHADOW at a time. Human approval is explicitly tied to a Candidate ID.
+// v2.2 = v2.1 Candidate Engine + Adaptive Research Layer.
+// Research is advisory only. It never auto-applies weights, thresholds, or trading.
+// Baseline is the permanent control. Exactly ONE challenger can be in SHADOW.
+// Human approval is scoped to one Candidate ID.
 
 validationHorizon = input.int(5, "Validation Horizon", minval=1)
 favorableAtr = input.float(0.50, "Favorable Outcome ATR", minval=0, step=0.05)
 minPattern = input.int(20, "Minimum Pattern Sample", minval=20)
 recentN = input.int(20, "Recent Pattern Samples", minval=5)
-minCompetition = input.int(10, "Minimum Competition Samples", minval=5)
+minCompetition = input.int(20, "Minimum Competition Samples", minval=5)
 minHoldout = input.int(10, "Minimum Holdout Samples", minval=5)
 archiveLimit = input.int(500, "Research Memory", minval=100)
 maxCandidates = input.int(20, "Candidate Registry", minval=4)
 approvedCandidateId = input.int(0, "HUMAN APPROVAL — Candidate ID", minval=0)
-activeShadowCandidateId = input.int(0, "ACTIVE SHADOW Candidate ID", minval=0)
+activeShadowCandidateId = input.int(0, "ACTIVE SHADOW — Candidate ID", minval=0)
+rollbackThreshold = input.float(0.10, "Rollback OOS Regression", minval=0, step=0.01)
 
 atr = ta.atr(14)
 volMean = ta.sma(volume, 20)
@@ -30,6 +31,7 @@ deltaImpulse = math.abs(delta) > volMean
 cvdImpulse = math.abs(cvd - cvd[1]) > ta.sma(math.abs(cvd - cvd[1]), 20)
 effort = volMean > 0 ? volume / volMean : 0
 absorption = rng > 0 and body / rng < 0.35 and volume > volMean * 1.25
+
 evidenceMask = (breakout ? 1 : 0) + (strongBody ? 2 : 0) + (deltaImpulse ? 4 : 0) + (cvdImpulse ? 8 : 0) + (effort > 1.2 ? 16 : 0) + (absorption ? 32 : 0)
 evidenceScore = (breakout ? 2 : 0) + (strongBody ? 1 : 0) + (barDir != 0 ? 1 : 0) + (deltaImpulse ? 2 : 0) + (cvdImpulse ? 2 : 0) + (effort > 1.2 ? 1 : 0) + (absorption ? -3 : 0)
 
@@ -42,33 +44,62 @@ retestDistance = not na(lastBreakout) ? math.abs(close - lastBreakout) / math.ma
 retest = not na(retestDistance) ? retestDistance <= 0.35 ? 1 : retestDistance <= 0.8 ? 2 : 0 : 0
 session = hour(time, "UTC") < 8 ? 0 : hour(time, "UTC") < 13 ? 1 : hour(time, "UTC") < 18 ? 2 : 3
 
-// ---------------- CANDIDATE REGISTRY ----------------------------------------
-var ids = array.new_int()
-var names = array.new_string()
-var thresholds = array.new_int()
-var trainS = array.new_int()
-var trainW = array.new_int()
-var holdS = array.new_int()
-var holdW = array.new_int()
-var approved = array.new_bool()
-var active = array.new_bool()
-var rolled = array.new_bool()
-var scores = array.new_float()
+// ============================================================================
+// v2.1 CANDIDATE REGISTRY + QUEUE
+// ============================================================================
+// State: 0=PENDING, 1=SHADOW, 2=FINISHED, 3=CHAMPION, 4=ROLLED_BACK.
+var candidateIds = array.new_int()
+var candidateNames = array.new_string()
+var candidateState = array.new_int()
+var candidateThreshold = array.new_float()
+var candidateTrainS = array.new_int()
+var candidateTrainW = array.new_int()
+var candidateHoldS = array.new_int()
+var candidateHoldW = array.new_int()
+var candidateApproved = array.new_bool()
+var candidateActive = array.new_bool()
+var candidateRolled = array.new_bool()
+var candidateScore = array.new_float()
+var candidateCreatedBar = array.new_int()
+
+var championCandidateId = 0
+var previousChampionId = 0
+var rollbackCount = 0
 
 if barstate.isfirst
-    array.push(ids, 1)
-    array.push(names, "BASELINE")
-    array.push(thresholds, 5)
-    array.push(trainS, 0)
-    array.push(trainW, 0)
-    array.push(holdS, 0)
-    array.push(holdW, 0)
-    array.push(approved, true)
-    array.push(active, true)
-    array.push(rolled, false)
-    array.push(scores, 0.0)
+    array.push(candidateIds, 1)
+    array.push(candidateNames, "BASELINE")
+    array.push(candidateState, 3)
+    array.push(candidateThreshold, 5.0)
+    array.push(candidateTrainS, 0)
+    array.push(candidateTrainW, 0)
+    array.push(candidateHoldS, 0)
+    array.push(candidateHoldW, 0)
+    array.push(candidateApproved, true)
+    array.push(candidateActive, true)
+    array.push(candidateRolled, false)
+    array.push(candidateScore, na)
+    array.push(candidateCreatedBar, bar_index)
 
-// ---------------- CAUSAL QUEUE ----------------------------------------------
+registryIndex(cid) => array.indexof(candidateIds, cid)
+
+// Human approval is per Candidate ID, never a global boolean.
+if array.size(candidateIds) > 1
+    for i = 1 to array.size(candidateIds) - 1
+        array.set(candidateApproved, i, array.get(candidateIds, i) == approvedCandidateId)
+
+shadowIdx = registryIndex(activeShadowCandidateId)
+shadowValid = activeShadowCandidateId > 1 and shadowIdx >= 0 and array.get(candidateActive, shadowIdx) and array.get(candidateApproved, shadowIdx) and not array.get(candidateRolled, shadowIdx) and array.get(candidateState, shadowIdx) != 3
+
+// Enforce one and only one Challenger SHADOW state.
+if shadowValid
+    for i = 1 to array.size(candidateIds) - 1
+        if i == shadowIdx
+            array.set(candidateState, i, 1)
+        else if array.get(candidateState, i) == 1
+            array.set(candidateState, i, 0)
+
+// Causal queue: every Decision freezes T data; Outcome is evaluated at T+H.
 var qBar = array.new_int()
 var qPrice = array.new_float()
 var qAtr = array.new_float()
@@ -78,15 +109,13 @@ var qRetest = array.new_int()
 var qSession = array.new_int()
 var qEvidence = array.new_int()
 var qCid = array.new_int()
-var qHold = array.new_bool()
+var qHoldout = array.new_bool()
 
-// Baseline is the permanent control. Only the selected Challenger can shadow.
-shadowIdx = array.indexof(ids, activeShadowCandidateId)
-shadowExists = activeShadowCandidateId > 1 and shadowIdx >= 0 and array.get(active, shadowIdx) and array.get(approved, shadowIdx) and not array.get(rolled, shadowIdx)
+baselineSignal = barstate.isconfirmed and direction != 0 and evidenceScore >= array.get(candidateThreshold, 0)
+shadowSignal = barstate.isconfirmed and shadowValid and direction != 0 and evidenceScore >= array.get(candidateThreshold, shadowIdx)
 
-baselineSignal = barstate.isconfirmed and direction != 0 and evidenceScore >= array.get(thresholds, 0)
-shadowSignal = barstate.isconfirmed and shadowExists and direction != 0 and evidenceScore >= array.get(thresholds, shadowIdx)
-
+// Baseline is the permanent control. One Challenger may shadow it; no other
+// Candidate is allowed to create observations.
 if baselineSignal and array.size(qBar) < 500
     array.push(qBar, bar_index)
     array.push(qPrice, close)
@@ -97,7 +126,7 @@ if baselineSignal and array.size(qBar) < 500
     array.push(qSession, session)
     array.push(qEvidence, evidenceMask)
     array.push(qCid, 1)
-    array.push(qHold, bar_index % 5 == 0)
+    array.push(qHoldout, bar_index % 5 == 0)
 
 if shadowSignal and array.size(qBar) < 500
     array.push(qBar, bar_index)
@@ -109,9 +138,11 @@ if shadowSignal and array.size(qBar) < 500
     array.push(qSession, session)
     array.push(qEvidence, evidenceMask)
     array.push(qCid, activeShadowCandidateId)
-    array.push(qHold, bar_index % 5 == 0)
+    array.push(qHoldout, bar_index % 5 == 0)
 
-// ---------------- RESEARCH MEMORY -------------------------------------------
+// ============================================================================
+// CAUSAL RESEARCH MEMORY
+// ============================================================================
 var mCtx = array.new_int()
 var mDir = array.new_int()
 var mRet = array.new_int()
@@ -120,7 +151,7 @@ var mEvidence = array.new_int()
 var mOut = array.new_int()
 var mCid = array.new_int()
 var mBar = array.new_int()
-var mHold = array.new_bool()
+var mHoldout = array.new_bool()
 
 memPush(c, d, r, s, e, o, cid, b, h) =>
     array.push(mCtx, c)
@@ -131,7 +162,7 @@ memPush(c, d, r, s, e, o, cid, b, h) =>
     array.push(mOut, o)
     array.push(mCid, cid)
     array.push(mBar, b)
-    array.push(mHold, h)
+    array.push(mHoldout, h)
     if array.size(mCtx) > archiveLimit
         array.shift(mCtx)
         array.shift(mDir)
@@ -141,39 +172,41 @@ memPush(c, d, r, s, e, o, cid, b, h) =>
         array.shift(mOut)
         array.shift(mCid)
         array.shift(mBar)
-        array.shift(mHold)
+        array.shift(mHoldout)
 
 if array.size(qBar) > 0
-    for i = array.size(qBar) - 1 to 0
-        if bar_index - array.get(qBar, i) >= validationHorizon
-            entry = array.get(qPrice, i)
-            decisionAtr = array.get(qAtr, i)
-            d = array.get(qDir, i)
+    for qi = array.size(qBar) - 1 to 0
+        if bar_index - array.get(qBar, qi) >= validationHorizon
+            entry = array.get(qPrice, qi)
+            decisionAtr = array.get(qAtr, qi)
+            d = array.get(qDir, qi)
             move = (close - entry) / decisionAtr
             outcome = d > 0 ? (move >= favorableAtr ? 1 : -1) : (move <= -favorableAtr ? 1 : -1)
-            cid = array.get(qCid, i)
-            isHoldout = array.get(qHold, i)
-            memPush(array.get(qCtx, i), d, array.get(qRetest, i), array.get(qSession, i), array.get(qEvidence, i), outcome, cid, array.get(qBar, i), isHoldout)
-            ci = array.indexof(ids, cid)
+            cid = array.get(qCid, qi)
+            isHoldout = array.get(qHoldout, qi)
+            memPush(array.get(qCtx, qi), d, array.get(qRetest, qi), array.get(qSession, qi), array.get(qEvidence, qi), outcome, cid, array.get(qBar, qi), isHoldout)
+            ci = registryIndex(cid)
             if ci >= 0
                 if isHoldout
-                    array.set(holdS, ci, array.get(holdS, ci) + 1)
-                    array.set(holdW, ci, array.get(holdW, ci) + (outcome == 1 ? 1 : 0))
+                    array.set(candidateHoldS, ci, array.get(candidateHoldS, ci) + 1)
+                    array.set(candidateHoldW, ci, array.get(candidateHoldW, ci) + (outcome == 1 ? 1 : 0))
                 else
-                    array.set(trainS, ci, array.get(trainS, ci) + 1)
-                    array.set(trainW, ci, array.get(trainW, ci) + (outcome == 1 ? 1 : 0))
-            array.remove(qBar, i)
-            array.remove(qPrice, i)
-            array.remove(qAtr, i)
-            array.remove(qDir, i)
-            array.remove(qCtx, i)
-            array.remove(qRetest, i)
-            array.remove(qSession, i)
-            array.remove(qEvidence, i)
-            array.remove(qCid, i)
-            array.remove(qHold, i)
+                    array.set(candidateTrainS, ci, array.get(candidateTrainS, ci) + 1)
+                    array.set(candidateTrainW, ci, array.get(candidateTrainW, ci) + (outcome == 1 ? 1 : 0))
+            array.remove(qBar, qi)
+            array.remove(qPrice, qi)
+            array.remove(qAtr, qi)
+            array.remove(qDir, qi)
+            array.remove(qCtx, qi)
+            array.remove(qRetest, qi)
+            array.remove(qSession, qi)
+            array.remove(qEvidence, qi)
+            array.remove(qCid, qi)
+            array.remove(qHoldout, qi)
 
-// ---------------- RESEARCH MINING -------------------------------------------
+// ============================================================================
+// RESEARCH PATTERN MINING
+// ============================================================================
 patternKey(c, d, r) => c * 100 + (d + 1) * 10 + r
 currentPatternKey = patternKey(context, direction, retest)
 
@@ -195,8 +228,11 @@ patternStats(k, recentOnly) =>
 histS = math.max(sAll - sRecent, 0)
 histW = math.max(wAll - wRecent, 0)
 histRate = histS > 0 ? histW / histS : na
-patternDrift = sRecent >= minHoldout and histS >= minPattern and rateRecent < histRate - 0.15
 
+// Historical vs Recent: drift means Recent has materially degraded.
+patternDrift = histS >= minPattern and sRecent >= minHoldout and not na(histRate) and not na(rateRecent) and rateRecent < histRate - 0.15
+
+// Recovery requires improvement of the current Recent window versus the prior Recent window.
 priorS = 0
 priorW = 0
 if array.size(mCtx) > 0
@@ -206,31 +242,76 @@ if array.size(mCtx) > 0
             priorS += 1
             priorW += array.get(mOut, i) == 1 ? 1 : 0
 priorRate = priorS > 0 ? priorW / priorS : na
-patternRecovery = sRecent >= minHoldout and priorS >= minHoldout and rateRecent > priorRate + 0.10
+patternRecovery = priorS >= minHoldout and sRecent >= minHoldout and not na(priorRate) and not na(rateRecent) and rateRecent > priorRate + 0.10
 
-// All 15 Evidence pair interactions are mined generically.
+// Explicit Context / Direction / Retest reliability.
+segmentStats(segmentType, segmentValue) =>
+    s = 0
+    w = 0
+    if array.size(mCtx) > 0
+        for i = 0 to array.size(mCtx) - 1
+            match = segmentType == 0 ? array.get(mCtx, i) == segmentValue : segmentType == 1 ? array.get(mDir, i) == segmentValue : array.get(mRet, i) == segmentValue
+            if match
+                s += 1
+                w += array.get(mOut, i) == 1 ? 1 : 0
+    [s, w, s > 0 ? w / s : na]
+
+[ctxN, ctxW, ctxRate] = segmentStats(0, context)
+[dirN, dirW, dirRate] = segmentStats(1, direction)
+[retN, retW, retRate] = segmentStats(2, retest)
+contextReliability = ctxN >= minPattern ? ctxRate : na
+directionReliability = dirN >= minPattern ? dirRate : na
+retestReliability = retN >= minPattern ? retRate : na
+
+// Session diversity and concentration.
+countSession(target) =>
+    n = 0
+    if array.size(mSession) > 0
+        for i = 0 to array.size(mSession) - 1
+            if array.get(mSession, i) == target
+                n += 1
+    n
+s0 = countSession(0)
+s1 = countSession(1)
+s2 = countSession(2)
+s3 = countSession(3)
+memN = array.size(mSession)
+maxSessionShare = memN > 0 ? math.max(math.max(s0, s1), math.max(s2, s3)) / memN : na
+sessionDiversity = (s0 > 0 ? 1 : 0) + (s1 > 0 ? 1 : 0) + (s2 > 0 ? 1 : 0) + (s3 > 0 ? 1 : 0)
+sessionConcentrationHigh = not na(maxSessionShare) and maxSessionShare > 0.70
+
+directionLong = 0
+directionShort = 0
+if array.size(mDir) > 0
+    for i = 0 to array.size(mDir) - 1
+        directionLong += array.get(mDir, i) > 0 ? 1 : 0
+        directionShort += array.get(mDir, i) < 0 ? 1 : 0
+directionConcentration = memN > 0 ? math.max(directionLong, directionShort) / memN : na
+
+// ============================================================================
+// GENERIC EVIDENCE INTERACTION MINING — ALL 15 PAIRS
+// ============================================================================
 var pairKeys = array.new_int()
 var pairS = array.new_int()
 var pairW = array.new_int()
 if barstate.isfirst
     for a = 0 to 4
         for b = a + 1 to 5
-            pk = (1 << a) + (1 << b)
-            array.push(pairKeys, pk)
+            array.push(pairKeys, (1 << a) + (1 << b))
             array.push(pairS, 0)
             array.push(pairW, 0)
 
 if array.size(mEvidence) > 0
     for j = 0 to array.size(pairKeys) - 1
-        sm = 0
-        ww = 0
+        ps = 0
+        pw = 0
         pk = array.get(pairKeys, j)
         for i = 0 to array.size(mEvidence) - 1
             if (array.get(mEvidence, i) & pk) == pk
-                sm += 1
-                ww += array.get(mOut, i) == 1 ? 1 : 0
-        array.set(pairS, j, sm)
-        array.set(pairW, j, ww)
+                ps += 1
+                pw += array.get(mOut, i) == 1 ? 1 : 0
+        array.set(pairS, j, ps)
+        array.set(pairW, j, pw)
 
 bestPair = 0
 bestPairRate = na
@@ -244,115 +325,193 @@ for j = 0 to array.size(pairKeys) - 1
             bestPairS := ps
             bestPair := array.get(pairKeys, j)
 
-// ---------------- RESEARCH -> CANDIDATE -------------------------------------
-// A Research Recommendation may create a PENDING Candidate with fixed
-// parameters. It does not activate it. Approval is per Candidate ID.
+// ============================================================================
+// RESEARCH CONFIDENCE + RESEARCH RECOMMENDATION
+// ============================================================================
+researchConfidence = sAll < minPattern ? "LOW" : (sessionConcentrationHigh or sessionDiversity < 3 or directionConcentration > 0.80) ? "MEDIUM" : "HIGH"
+researchRecommendation = bestPairS >= minPattern and not na(bestPairRate) and (na(rateAll) or bestPairRate > rateAll + 0.05)
+
+// Recommendation creates a PENDING proposal only. It does not activate it.
 var lastRecommendationKey = na
-researchRecommendation = bestPairS >= minPattern and (na(rateAll) or bestPairRate > rateAll + 0.05)
-if researchRecommendation and (na(lastRecommendationKey) or lastRecommendationKey != currentPatternKey) and array.size(ids) < maxCandidates
-    newId = array.size(ids) + 1
-    suggestedThreshold = bestPairRate >= 0.70 ? 7 : 6
-    array.push(ids, newId)
-    array.push(names, "RESEARCH_P" + str.tostring(newId))
-    array.push(thresholds, suggestedThreshold)
-    array.push(trainS, 0)
-    array.push(trainW, 0)
-    array.push(holdS, 0)
-    array.push(holdW, 0)
-    array.push(approved, false)
-    array.push(active, true)
-    array.push(rolled, false)
-    array.push(scores, na)
+if researchRecommendation and (na(lastRecommendationKey) or lastRecommendationKey != currentPatternKey) and array.size(candidateIds) < maxCandidates
+    newId = array.size(candidateIds) + 1
+    suggestedThreshold = bestPairRate >= 0.70 ? 7.0 : 6.0
+    array.push(candidateIds, newId)
+    array.push(candidateNames, "RESEARCH_P" + str.tostring(newId))
+    array.push(candidateState, 0)
+    array.push(candidateThreshold, suggestedThreshold)
+    array.push(candidateTrainS, 0)
+    array.push(candidateTrainW, 0)
+    array.push(candidateHoldS, 0)
+    array.push(candidateHoldW, 0)
+    array.push(candidateApproved, false)
+    array.push(candidateActive, true)
+    array.push(candidateRolled, false)
+    array.push(candidateScore, na)
+    array.push(candidateCreatedBar, bar_index)
     lastRecommendationKey := currentPatternKey
 
-// Explicit per-Candidate human approval. There is no global approval switch.
-if array.size(ids) > 1
-    for i = 1 to array.size(ids) - 1
-        array.set(approved, i, array.get(ids, i) == approvedCandidateId)
+// ============================================================================
+// BASELINE HOLDOUT + CANDIDATE COMPETITION
+// ============================================================================
+// Baseline has independent Training and Holdout metrics.
+bTrainN = array.get(candidateTrainS, 0)
+bTrainW = array.get(candidateTrainW, 0)
+bHoldoutN = array.get(candidateHoldS, 0)
+bHoldoutW = array.get(candidateHoldW, 0)
+baselineTrainRate = bTrainN > 0 ? bTrainW / bTrainN : na
+baselineHoldoutRate = bHoldoutN >= minHoldout ? bHoldoutW / bHoldoutN : na
 
-// ---------------- COMPETITION ------------------------------------------------
-// Fixed composite score: Training + OOS Lift + Stability + Quality + Confidence
-// - Regression penalty. OOS is always measured against the permanent baseline.
-baseTrain = array.get(trainS, 0) > 0 ? array.get(trainW, 0) / array.get(trainS, 0) : na
-baseOos = array.get(holdS, 0) >= minHoldout ? array.get(holdW, 0) / array.get(holdS, 0) : na
-
-champ = -1
-bestScore = -1e9
-if array.size(ids) > 1
-    for i = 1 to array.size(ids) - 1
-        ts = array.get(trainS, i)
-        tw = array.get(trainW, i)
-        hs = array.get(holdS, i)
-        hw = array.get(holdW, i)
+// Composite Competition Score: Training, OOS Lift, Stability, Quality,
+// Confidence and Regression. Raw Training Win Rate alone can never select a winner.
+proposedWinnerIdx = -1
+bestCompetitionScore = -1e9
+if array.size(candidateIds) > 1
+    for i = 1 to array.size(candidateIds) - 1
+        ts = array.get(candidateTrainS, i)
+        tw = array.get(candidateTrainW, i)
+        hs = array.get(candidateHoldS, i)
+        hw = array.get(candidateHoldW, i)
         trainRate = ts > 0 ? tw / ts : na
         oosRate = hs >= minHoldout ? hw / hs : na
-        oosLift = not na(oosRate) and not na(baseOos) ? oosRate - baseOos : 0.0
+        oosLift = not na(oosRate) and not na(baselineHoldoutRate) ? oosRate - baselineHoldoutRate : na
         stability = not na(trainRate) and not na(oosRate) ? 1.0 - math.min(math.abs(trainRate - oosRate), 1.0) : 0.0
-        quality = ts >= minCompetition ? math.min(ts / minCompetition, 2.0) / 2.0 : 0.0
+        quality = ts >= minCompetition ? math.min(ts / (minCompetition * 2.0), 1.0) : 0.0
         confidence = ts + hs >= 40 ? 1.0 : ts + hs >= 20 ? 0.7 : 0.4
-        regression = not na(baseOos) and not na(oosRate) and oosRate < baseOos - 0.10 ? 1.0 : 0.0
-        score = not na(trainRate) ? trainRate * 0.20 + oosLift * 0.40 + stability * 0.15 + quality * 0.10 + confidence * 0.10 - regression * 0.15 : -1e9
-        array.set(scores, i, score)
-        if score > bestScore
-            bestScore := score
-            champ := i
+        regression = not na(oosRate) and not na(baselineHoldoutRate) and oosRate < baselineHoldoutRate - rollbackThreshold ? 1.0 : 0.0
+        compScore = not na(trainRate) ? trainRate * 0.20 + (na(oosLift) ? 0.0 : oosLift) * 0.40 + stability * 0.15 + quality * 0.10 + confidence * 0.10 - regression * 0.15 : -1e9
+        array.set(candidateScore, i, compScore)
+        eligible = ts >= minCompetition and hs >= minHoldout and not na(oosLift) and oosLift >= 0 and array.get(candidateState, i) != 4 and array.get(candidateActive, i)
+        if eligible and compScore > bestCompetitionScore
+            bestCompetitionScore := compScore
+            proposedWinnerIdx := i
 
-champName = champ >= 0 ? array.get(names, champ) : "NONE"
+proposedWinnerId = proposedWinnerIdx >= 0 ? array.get(candidateIds, proposedWinnerIdx) : 0
 
-// Monitoring / rollback is a warning state. It does not select a replacement.
-activeIdx = array.indexof(ids, activeShadowCandidateId)
-activeOos = activeIdx > 0 and array.get(holdS, activeIdx) >= minHoldout ? array.get(holdW, activeIdx) / array.get(holdS, activeIdx) : na
-rollbackWarning = activeIdx > 0 and not na(baseOos) and not na(activeOos) and activeOos < baseOos - 0.10
-if rollbackWarning
-    array.set(rolled, activeIdx, true)
+// A Candidate becomes FINISHED once its evaluation data are sufficient and it is no longer shadowing.
+if array.size(candidateIds) > 1
+    for i = 1 to array.size(candidateIds) - 1
+        if array.get(candidateState, i) == 1 and array.get(candidateIds, i) != activeShadowCandidateId
+            array.set(candidateState, i, 2)
+        else if array.get(candidateState, i) == 0 and array.get(candidateTrainS, i) >= minCompetition and array.get(candidateHoldS, i) >= minHoldout
+            array.set(candidateState, i, 2)
 
-researchConfidence = sAll < minPattern ? "LOW" : histS < minPattern or sRecent < minHoldout ? "MEDIUM" : "HIGH"
-lifecycle = patternDrift ? "DRIFT" : patternRecovery ? "RECOVERY" : sAll >= minPattern ? "RELIABLE" : "EMERGING"
-recommendationText = patternDrift ? "REVIEW DRIFT" : patternRecovery ? "CONTINUE OBSERVATION" : researchRecommendation ? "CREATE CANDIDATE FROM RESEARCH" : "COLLECT MORE DATA"
+// ============================================================================
+// CHAMPION / CHALLENGER / APPROVAL / MONITORING / ROLLBACK
+// ============================================================================
+// Promotion is human-gated. The approved ID must equal the proposed winner.
+if proposedWinnerIdx >= 0 and proposedWinnerId == approvedCandidateId and array.get(candidateApproved, proposedWinnerIdx)
+    if championCandidateId != proposedWinnerId
+        previousChampionId := championCandidateId
+        championCandidateId := proposedWinnerId
+        array.set(candidateState, proposedWinnerIdx, 3)
 
-// ---------------- PANEL -----------------------------------------------------
-var table t = table.new(position.top_right, 2, 18, border_width=1)
+championIdx = registryIndex(championCandidateId)
+championOos = championIdx > 0 and array.get(candidateHoldS, championIdx) >= minHoldout ? array.get(candidateHoldW, championIdx) / array.get(candidateHoldS, championIdx) : na
+championRegression = championIdx > 0 and not na(championOos) and not na(baselineHoldoutRate) and championOos < baselineHoldoutRate - rollbackThreshold
+
+activeOos = shadowValid and array.get(candidateHoldS, shadowIdx) >= minHoldout ? array.get(candidateHoldW, shadowIdx) / array.get(candidateHoldS, shadowIdx) : na
+activeOosLift = not na(activeOos) and not na(baselineHoldoutRate) ? activeOos - baselineHoldoutRate : na
+activeRegression = not na(activeOosLift) and activeOosLift < -rollbackThreshold
+
+// Rollback is monitoring logic: it deactivates a regressed Champion/Shadow and
+// restores the previous Champion if one exists, otherwise Baseline is fallback.
+if championRegression
+    oldChampion = championCandidateId
+    if previousChampionId > 1
+        championCandidateId := previousChampionId
+        previousIdx = registryIndex(previousChampionId)
+        if previousIdx >= 0
+            array.set(candidateState, previousIdx, 3)
+    else
+        championCandidateId := 0
+    oldIdx = registryIndex(oldChampion)
+    if oldIdx > 0
+        array.set(candidateState, oldIdx, 4)
+        array.set(candidateActive, oldIdx, false)
+        array.set(candidateRolled, oldIdx, true)
+    previousChampionId := 0
+    rollbackCount += 1
+
+if activeRegression and shadowIdx > 0
+    array.set(candidateState, shadowIdx, 4)
+    array.set(candidateActive, shadowIdx, false)
+    array.set(candidateRolled, shadowIdx, true)
+    rollbackCount += 1
+
+monitoringStatus = championRegression ? "CHAMPION ROLLBACK" : activeRegression ? "SHADOW ROLLBACK" : "STABLE"
+
+// ============================================================================
+// PANEL
+// ============================================================================
+var table t = table.new(position.top_right, 2, 30, border_width=1)
 if barstate.islast
-    activeName = activeIdx > 0 ? array.get(names, activeIdx) : "NONE"
+    activeName = shadowValid ? array.get(candidateNames, shadowIdx) : "NONE"
+    championName = championCandidateId > 0 and championIdx >= 0 ? array.get(candidateNames, championIdx) : "BASELINE"
+    previousName = previousChampionId > 0 and registryIndex(previousChampionId) >= 0 ? array.get(candidateNames, registryIndex(previousChampionId)) : "NONE"
     table.cell(t, 0, 0, "AuctionAI v2.2")
-    table.cell(t, 1, 0, "v2.1 + Research")
-    table.cell(t, 0, 1, "Active Shadow")
-    table.cell(t, 1, 1, activeName)
-    table.cell(t, 0, 2, "Research Champion")
-    table.cell(t, 1, 2, champName)
-    table.cell(t, 0, 3, "Approved ID")
-    table.cell(t, 1, 3, str.tostring(approvedCandidateId))
-    table.cell(t, 0, 4, "Baseline OOS")
-    table.cell(t, 1, 4, not na(baseOos) ? str.tostring(baseOos * 100, "#.0") + "%" : "WAIT")
-    table.cell(t, 0, 5, "Candidate OOS")
-    table.cell(t, 1, 5, not na(activeOos) ? str.tostring(activeOos * 100, "#.0") + "%" : "WAIT")
-    table.cell(t, 0, 6, "Candidate OOS Lift")
-    table.cell(t, 1, 6, not na(activeOos) and not na(baseOos) ? str.tostring((activeOos - baseOos) * 100, "#.0") + "%" : "WAIT")
-    table.cell(t, 0, 7, "Pattern Samples")
-    table.cell(t, 1, 7, str.tostring(sAll))
-    table.cell(t, 0, 8, "Historical / Recent")
-    table.cell(t, 1, 8, not na(histRate) ? str.tostring(histRate * 100, "#.0") + "% / " + str.tostring(rateRecent * 100, "#.0") + "%" : "BUILDING")
-    table.cell(t, 0, 9, "Lifecycle")
-    table.cell(t, 1, 9, lifecycle)
-    table.cell(t, 0, 10, "Research Confidence")
-    table.cell(t, 1, 10, researchConfidence)
-    table.cell(t, 0, 11, "Best Interaction")
-    table.cell(t, 1, 11, bestPairS >= minPattern ? str.tostring(bestPair) + " @ " + str.tostring(bestPairRate * 100, "#.0") + "%" : "INSUFFICIENT")
-    table.cell(t, 0, 12, "Recommendation")
-    table.cell(t, 1, 12, recommendationText)
-    table.cell(t, 0, 13, "Rollback Monitor")
-    table.cell(t, 1, 13, rollbackWarning ? "WARNING" : "STABLE")
-    table.cell(t, 0, 14, "Pending Queue")
-    table.cell(t, 1, 14, str.tostring(array.size(qBar)))
-    table.cell(t, 0, 15, "Registry")
-    table.cell(t, 1, 15, str.tostring(array.size(ids)))
-    table.cell(t, 0, 16, "Auto Adaptation")
-    table.cell(t, 1, 16, "DISABLED")
-    table.cell(t, 0, 17, "Auto Trading")
-    table.cell(t, 1, 17, "DISABLED")
+    table.cell(t, 1, 0, "v2.1 Candidate Engine + v2.2 Research")
+    table.cell(t, 0, 1, "Registry")
+    table.cell(t, 1, 1, str.tostring(array.size(candidateIds)))
+    table.cell(t, 0, 2, "Pending Queue")
+    table.cell(t, 1, 2, str.tostring(array.size(qBar)))
+    table.cell(t, 0, 3, "Active Shadow")
+    table.cell(t, 1, 3, activeName)
+    table.cell(t, 0, 4, "Proposed Winner")
+    table.cell(t, 1, 4, proposedWinnerId > 0 ? str.tostring(proposedWinnerId) : "NONE")
+    table.cell(t, 0, 5, "Competition Score")
+    table.cell(t, 1, 5, proposedWinnerIdx >= 0 ? str.tostring(array.get(candidateScore, proposedWinnerIdx), "#.000") : "WAIT")
+    table.cell(t, 0, 6, "Approved Candidate")
+    table.cell(t, 1, 6, str.tostring(approvedCandidateId))
+    table.cell(t, 0, 7, "Champion")
+    table.cell(t, 1, 7, championName)
+    table.cell(t, 0, 8, "Previous Champion")
+    table.cell(t, 1, 8, previousName)
+    table.cell(t, 0, 9, "Baseline Training")
+    table.cell(t, 1, 9, not na(baselineTrainRate) ? str.tostring(baselineTrainRate * 100, "#.0") + "% (" + str.tostring(bTrainN) + ")" : "WAIT")
+    table.cell(t, 0, 10, "Baseline Holdout")
+    table.cell(t, 1, 10, not na(baselineHoldoutRate) ? str.tostring(baselineHoldoutRate * 100, "#.0") + "% (" + str.tostring(bHoldoutN) + ")" : "WAIT")
+    table.cell(t, 0, 11, "Candidate OOS")
+    table.cell(t, 1, 11, not na(activeOos) ? str.tostring(activeOos * 100, "#.0") + "%" : "WAIT")
+    table.cell(t, 0, 12, "Candidate OOS Lift")
+    table.cell(t, 1, 12, not na(activeOosLift) ? str.tostring(activeOosLift * 100, "#.0") + "%" : "WAIT")
+    table.cell(t, 0, 13, "Pattern Samples")
+    table.cell(t, 1, 13, str.tostring(sAll))
+    table.cell(t, 0, 14, "Context Reliability")
+    table.cell(t, 1, 14, not na(contextReliability) ? str.tostring(contextReliability * 100, "#.0") + "%" : "BUILDING")
+    table.cell(t, 0, 15, "Direction Reliability")
+    table.cell(t, 1, 15, not na(directionReliability) ? str.tostring(directionReliability * 100, "#.0") + "%" : "BUILDING")
+    table.cell(t, 0, 16, "Retest Reliability")
+    table.cell(t, 1, 16, not na(retestReliability) ? str.tostring(retestReliability * 100, "#.0") + "%" : "BUILDING")
+    table.cell(t, 0, 17, "Historical / Recent")
+    table.cell(t, 1, 17, not na(histRate) and not na(rateRecent) ? str.tostring(histRate * 100, "#.0") + "% / " + str.tostring(rateRecent * 100, "#.0") + "%" : "BUILDING")
+    table.cell(t, 0, 18, "Pattern Lifecycle")
+    table.cell(t, 1, 18, patternDrift ? "DRIFT" : patternRecovery ? "RECOVERY" : sAll >= minPattern ? "RELIABLE" : sAll >= minHoldout ? "SUPPORTED" : "EMERGING")
+    table.cell(t, 0, 19, "Research Confidence")
+    table.cell(t, 1, 19, researchConfidence)
+    table.cell(t, 0, 20, "Session Diversity")
+    table.cell(t, 1, 20, str.tostring(sessionDiversity) + "/4")
+    table.cell(t, 0, 21, "Session Concentration")
+    table.cell(t, 1, 21, sessionConcentrationHigh ? "HIGH" : "NORMAL")
+    table.cell(t, 0, 22, "Best Interaction")
+    table.cell(t, 1, 22, bestPairS >= minPattern ? str.tostring(bestPair) + " @ " + str.tostring(bestPairRate * 100, "#.0") + "%" : "INSUFFICIENT")
+    table.cell(t, 0, 23, "Recommendation")
+    table.cell(t, 1, 23, patternDrift ? "REVIEW DRIFT" : patternRecovery ? "RECOVERY" : researchRecommendation ? "CREATE PENDING CANDIDATE" : "COLLECT MORE DATA")
+    table.cell(t, 0, 24, "Monitoring")
+    table.cell(t, 1, 24, monitoringStatus)
+    table.cell(t, 0, 25, "Rollback Count")
+    table.cell(t, 1, 25, str.tostring(rollbackCount))
+    table.cell(t, 0, 26, "Memory")
+    table.cell(t, 1, 26, str.tostring(array.size(mCtx)))
+    table.cell(t, 0, 27, "Auto Adaptation")
+    table.cell(t, 1, 27, "DISABLED")
+    table.cell(t, 0, 28, "Auto Trading")
+    table.cell(t, 1, 28, "DISABLED")
+    table.cell(t, 0, 29, "Architecture")
+    table.cell(t, 1, 29, "v2.1 + v2.2 INTEGRATED")
 
 plotshape(patternDrift, title="Research Drift", style=shape.circle, location=location.abovebar, size=size.tiny, color=color.orange, text="DRIFT")
 plotshape(patternRecovery, title="Research Recovery", style=shape.circle, location=location.belowbar, size=size.tiny, color=color.aqua, text="REC")
 alertcondition(patternDrift, "AuctionAI Research Drift", "Research-only: pattern drift detected.")
 alertcondition(patternRecovery, "AuctionAI Research Recovery", "Research-only: pattern recovery detected.")
-alertcondition(researchRecommendation, "AuctionAI Research Recommendation", "Research-only: a Candidate recommendation was generated.")
+alertcondition(researchRecommendation, "AuctionAI Research Recommendation", "Research-only: Candidate recommendation generated; human approval required.")
