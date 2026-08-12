@@ -1,0 +1,74 @@
+//@version=6
+indicator("AuctionAI v2.1 - Candidate Competition + Learning Memory", overlay=true, max_bars_back=5000)
+
+validationHorizon = input.int(5,"Validation Horizon",minval=1)
+favorableAtr = input.float(0.50,"Favorable Threshold (ATR)",minval=0,step=0.05)
+archiveLimit = input.int(500,"Archive Size",minval=100,maxval=1000)
+researchMin = input.int(50,"Research Minimum",minval=20,maxval=500)
+shadowMin = input.int(100,"Minimum Shadow Outcomes",minval=50,maxval=500)
+shadowMaxInput = input.int(20,"Shadow Candidates",minval=1,maxval=50)
+
+atr = ta.atr(14)
+body = math.abs(close-open)
+range_ = high-low
+upperWick = high-math.max(open,close)
+lowerWick = math.min(open,close)-low
+
+// Candidate evidence
+breakout = close > ta.highest(high,20)[1] or close < ta.lowest(low,20)[1]
+strongBody = atr > 0 and body/atr >= 0.8
+result = close > open ? 1 : close < open ? -1 : 0
+deltaProxy = volume * result
+cvdProxy = ta.cum(deltaProxy)
+effort = atr > 0 ? volume / math.max(ta.sma(volume,20),1) : 0
+absorption = range_ > 0 and body/range_ < 0.35 and volume > ta.sma(volume,20)*1.25
+
+// Evidence Score is intentionally separate from Acceptance Score.
+evidenceScore = (breakout ? 2 : 0) + (strongBody ? 1 : 0) + (result != 0 ? 1 : 0) + (math.abs(deltaProxy) > ta.sma(volume,20) ? 2 : 0) + (math.abs(cvdProxy-cvdProxy[1]) > ta.sma(math.abs(cvdProxy-cvdProxy[1]),20) ? 2 : 0) + (effort > 1.2 ? 1 : 0) + (absorption ? -3 : 0)
+
+// Acceptance uses evidence quality plus outcome validation rather than a fixed mechanical point sum.
+forwardMove = close[validationHorizon] != 0 ? (close-close[validationHorizon]) / math.max(atr, syminfo.mintick) : na
+acceptedLong = result > 0 and not na(forwardMove) and forwardMove >= favorableAtr
+acceptedShort = result < 0 and not na(forwardMove) and forwardMove <= -favorableAtr
+acceptanceScore = (acceptedLong or acceptedShort ? 1 : 0) + (evidenceScore >= 5 ? 1 : 0) + (effort > 1.2 and not absorption ? 1 : 0)
+
+plotshape(acceptedLong, title="Accepted Long", style=shape.triangleup, location=location.belowbar, size=size.tiny, color=color.lime, text="A")
+plotshape(acceptedShort, title="Accepted Short", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.red, text="A")
+
+var int wins = 0
+var int losses = 0
+var float archiveScore = 0.0
+if barstate.isconfirmed
+    if acceptedLong or acceptedShort
+        wins += 1
+        archiveScore += acceptanceScore
+    else if result != 0 and not na(forwardMove)
+        losses += 1
+        archiveScore -= 1
+
+sample = wins + losses
+winRate = sample > 0 ? wins / sample : na
+researchReady = sample >= researchMin
+shadowReady = sample >= shadowMin
+
+var table panel = table.new(position.top_right, 2, 8, border_width=1)
+if barstate.islast
+    table.cell(panel,0,0,"AuctionAI v2.1",text_color=color.white)
+    table.cell(panel,1,0,"Professional",text_color=color.white)
+    table.cell(panel,0,1,"Evidence",text_color=color.white)
+    table.cell(panel,1,1,str.tostring(evidenceScore),text_color=color.white)
+    table.cell(panel,0,2,"Acceptance",text_color=color.white)
+    table.cell(panel,1,2,str.tostring(acceptanceScore),text_color=color.white)
+    table.cell(panel,0,3,"Wins / Losses",text_color=color.white)
+    table.cell(panel,1,3,str.tostring(wins)+" / "+str.tostring(losses),text_color=color.white)
+    table.cell(panel,0,4,"Win Rate",text_color=color.white)
+    table.cell(panel,1,4,researchReady ? str.tostring(winRate*100,"#.0")+"%" : "Collecting",text_color=color.white)
+    table.cell(panel,0,5,"Archive Score",text_color=color.white)
+    table.cell(panel,1,5,str.tostring(archiveScore,"#.0"),text_color=color.white)
+    table.cell(panel,0,6,"Research",text_color=color.white)
+    table.cell(panel,1,6,researchReady ? "READY" : "BUILDING",text_color=color.white)
+    table.cell(panel,0,7,"Shadow",text_color=color.white)
+    table.cell(panel,1,7,shadowReady ? "READY" : "WAITING",text_color=color.white)
+
+alertcondition(acceptedLong,"AuctionAI Accepted Long","AuctionAI accepted long candidate")
+alertcondition(acceptedShort,"AuctionAI Accepted Short","AuctionAI accepted short candidate")
