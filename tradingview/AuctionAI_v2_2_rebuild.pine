@@ -1,0 +1,528 @@
+//@version=6
+indicator("AuctionAI v2.2 - Candidate Engine + Adaptive Research", overlay=true, max_bars_back=5000)
+
+// ============================================================================
+// AUCTIONAI v2.2 REBUILD
+// ============================================================================
+// v2.2 is an additive research layer on top of a Candidate Engine.
+//
+// HARD ARCHITECTURAL RULE:
+// Research may observe history, mine patterns, calculate reliability and make
+// recommendations. It may NOT automatically modify weights, thresholds,
+// acceptance rules, entries, exits, SL, TP or position sizing.
+//
+// Causal outcome model:
+//   Decision @ T -> pending observation -> outcome resolved @ T + H
+// The evidence/context/retest/direction stored for the observation are frozen
+// at T. The outcome is calculated only when the horizon has elapsed.
+// ============================================================================
+
+// ------------------------------- CONFIG -------------------------------------
+validationHorizon = input.int(5, "Validation Horizon", minval=1, maxval=100)
+favorableAtr = input.float(0.50, "Favorable Outcome (ATR)", minval=0, step=0.05)
+minimumPatternSample = input.int(20, "Minimum Pattern Sample", minval=20, maxval=500)
+recentPatternSamples = input.int(20, "Recent Pattern Samples", minval=5, maxval=100)
+archiveLimit = input.int(500, "Research Memory Limit", minval=100, maxval=2000)
+maxPending = input.int(200, "Pending Observation Queue", minval=50, maxval=500)
+maxCandidates = input.int(20, "Candidate Registry Size", minval=4, maxval=50)
+competitionMin = input.int(10, "Competition Minimum Outcomes", minval=5, maxval=100)
+holdoutMin = input.int(10, "Holdout Minimum Outcomes", minval=5, maxval=100)
+recentDriftSample = input.int(20, "Drift Recent Samples", minval=10, maxval=100)
+recentDriftThreshold = input.float(0.15, "Drift Rate Gap", minval=0.05, maxval=0.50, step=0.05)
+manualApproval = input.bool(false, "HUMAN APPROVAL: Enable Candidate Promotion")
+
+// ------------------------------- EVIDENCE -----------------------------------
+atr = ta.atr(14)
+volMean = ta.sma(volume, 20)
+body = math.abs(close - open)
+range_ = high - low
+
+breakoutLong = close > ta.highest(high, 20)[1]
+breakoutShort = close < ta.lowest(low, 20)[1]
+breakout = breakoutLong or breakoutShort
+strongBody = atr > 0 and body / atr >= 0.8
+barDirection = close > open ? 1 : close < open ? -1 : 0
+deltaProxy = volume * barDirection
+cvdProxy = ta.cum(deltaProxy)
+deltaImpulse = math.abs(deltaProxy) > volMean
+cvdImpulse = math.abs(cvdProxy - cvdProxy[1]) > ta.sma(math.abs(cvdProxy - cvdProxy[1]), 20)
+effort = volMean > 0 ? volume / volMean : 0.0
+absorption = range_ > 0 and body / range_ < 0.35 and volume > volMean * 1.25
+
+// Evidence bits: 1 Breakout, 2 StrongBody, 4 Delta, 8 CVD, 16 Effort, 32 Absorption.
+evidenceMask = (breakout ? 1 : 0) + (strongBody ? 2 : 0) + (deltaImpulse ? 4 : 0) + (cvdImpulse ? 8 : 0) + (effort > 1.2 ? 16 : 0) + (absorption ? 32 : 0)
+evidenceScore = (breakout ? 2 : 0) + (strongBody ? 1 : 0) + (barDirection != 0 ? 1 : 0) + (deltaImpulse ? 2 : 0) + (cvdImpulse ? 2 : 0) + (effort > 1.2 ? 1 : 0) + (absorption ? -3 : 0)
+
+// ------------------------------- CONTEXT ------------------------------------
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+trendContext = math.abs(ema20 - ema50) > atr * 0.35
+contextCode = trendContext ? 1 : 0
+contextName = trendContext ? "TREND" : "RANGE"
+
+directionCode = barDirection
+ directionName = directionCode > 0 ? "LONG" : directionCode < 0 ? "SHORT" : "NEUTRAL"
+
+// Descriptive retest state. It is frozen when a candidate observation is made.
+lastBreakout = ta.valuewhen(breakout, close, 0)
+retestDistance = not na(lastBreakout) ? math.abs(close - lastBreakout) / math.max(atr, syminfo.mintick) : na
+retestCode = not na(retestDistance) ? retestDistance <= 0.35 ? 1 : retestDistance <= 0.80 ? 2 : 0 : 0
+retestName = retestCode == 1 ? "HOLD" : retestCode == 2 ? "RECLAIM" : "OTHER"
+
+hourUtc = hour(time, "UTC")
+sessionCode = hourUtc < 8 ? 0 : hourUtc < 13 ? 1 : hourUtc < 18 ? 2 : 3
+sessionName = sessionCode == 0 ? "ASIA" : sessionCode == 1 ? "LONDON" : sessionCode == 2 ? "NY" : "OTHER"
+
+// -------------------------- CANDIDATE REGISTRY ------------------------------
+// Candidate variants are intentionally explicit. Their parameter values are
+// fixed by the registry; research does not mutate them.
+var candidateIds = array.new_int()
+var candidateNames = array.new_string()
+var candidateEvidenceThreshold = array.new_int()
+var candidateFavorableAtr = array.new_float()
+var candidateSamples = array.new_int()
+var candidateWins = array.new_int()
+var candidateHoldoutSamples = array.new_int()
+var candidateHoldoutWins = array.new_int()
+var candidateActive = array.new_bool()
+var candidateApproved = array.new_bool()
+var candidateIsChampion = array.new_bool()
+var candidateIsChallenger = array.new_bool()
+var candidateScore = array.new_float()
+var candidateRolledBack = array.new_bool()
+
+if barstate.isfirst
+    // Baseline + deliberately fixed challengers. No adaptive mutation.
+    array.push(candidateIds, 1)
+    array.push(candidateNames, "Baseline")
+    array.push(candidateEvidenceThreshold, 5)
+    array.push(candidateFavorableAtr, favorableAtr)
+    array.push(candidateSamples, 0)
+    array.push(candidateWins, 0)
+    array.push(candidateHoldoutSamples, 0)
+    array.push(candidateHoldoutWins, 0)
+    array.push(candidateActive, true)
+    array.push(candidateApproved, true)
+    array.push(candidateIsChampion, true)
+    array.push(candidateIsChallenger, false)
+    array.push(candidateScore, 0.0)
+    array.push(candidateRolledBack, false)
+
+    array.push(candidateIds, 2)
+    array.push(candidateNames, "Evidence6")
+    array.push(candidateEvidenceThreshold, 6)
+    array.push(candidateFavorableAtr, favorableAtr)
+    array.push(candidateSamples, 0)
+    array.push(candidateWins, 0)
+    array.push(candidateHoldoutSamples, 0)
+    array.push(candidateHoldoutWins, 0)
+    array.push(candidateActive, true)
+    array.push(candidateApproved, false)
+    array.push(candidateIsChampion, false)
+    array.push(candidateIsChallenger, true)
+    array.push(candidateScore, 0.0)
+    array.push(candidateRolledBack, false)
+
+    array.push(candidateIds, 3)
+    array.push(candidateNames, "Evidence7")
+    array.push(candidateEvidenceThreshold, 7)
+    array.push(candidateFavorableAtr, favorableAtr)
+    array.push(candidateSamples, 0)
+    array.push(candidateWins, 0)
+    array.push(candidateHoldoutSamples, 0)
+    array.push(candidateHoldoutWins, 0)
+    array.push(candidateActive, true)
+    array.push(candidateApproved, false)
+    array.push(candidateIsChampion, false)
+    array.push(candidateIsChallenger, true)
+    array.push(candidateScore, 0.0)
+    array.push(candidateRolledBack, false)
+
+// --------------------------- PENDING QUEUE ----------------------------------
+// Each row freezes the Decision-Time state. Nothing is recomputed from the
+// current bar when the outcome is eventually resolved.
+var pendingDecisionBar = array.new_int()
+var pendingEntryPrice = array.new_float()
+var pendingAtr = array.new_float()
+var pendingDirection = array.new_int()
+var pendingContext = array.new_int()
+var pendingDirectionCode = array.new_int()
+var pendingRetest = array.new_int()
+var pendingSession = array.new_int()
+var pendingEvidenceMask = array.new_int()
+var pendingCandidateId = array.new_int()
+var pendingHoldout = array.new_bool()
+
+// ---------------------------- RESEARCH MEMORY --------------------------------
+var memoryContext = array.new_int()
+var memoryDirection = array.new_int()
+var memoryRetest = array.new_int()
+var memorySession = array.new_int()
+var memoryEvidence = array.new_int()
+var memoryOutcome = array.new_int()
+var memoryCandidate = array.new_int()
+var memoryBar = array.new_int()
+var memoryHoldout = array.new_bool()
+
+pushMemory(_context, _direction, _retest, _session, _evidence, _outcome, _candidate, _bar, _holdout) =>
+    array.push(memoryContext, _context)
+    array.push(memoryDirection, _direction)
+    array.push(memoryRetest, _retest)
+    array.push(memorySession, _session)
+    array.push(memoryEvidence, _evidence)
+    array.push(memoryOutcome, _outcome)
+    array.push(memoryCandidate, _candidate)
+    array.push(memoryBar, _bar)
+    array.push(memoryHoldout, _holdout)
+    if array.size(memoryContext) > archiveLimit
+        array.shift(memoryContext)
+        array.shift(memoryDirection)
+        array.shift(memoryRetest)
+        array.shift(memorySession)
+        array.shift(memoryEvidence)
+        array.shift(memoryOutcome)
+        array.shift(memoryCandidate)
+        array.shift(memoryBar)
+        array.shift(memoryHoldout)
+
+// -------------------------- CANDIDATE DECISION -------------------------------
+// A candidate qualifies for an observation only when its fixed evidence rule
+// is satisfied. Human approval controls promotion, not historical calculation.
+for ci = 0 to array.size(candidateIds) - 1
+    candidateId = array.get(candidateIds, ci)
+    threshold = array.get(candidateEvidenceThreshold, ci)
+    isActive = array.get(candidateActive, ci)
+    isApproved = array.get(candidateApproved, ci)
+    rolledBack = array.get(candidateRolledBack, ci)
+    eligible = isActive and not rolledBack and (candidateId == 1 or isApproved or manualApproval)
+    candidateSignal = eligible and directionCode != 0 and evidenceScore >= threshold
+    if barstate.isconfirmed and candidateSignal and array.size(pendingDecisionBar) < maxPending
+        array.push(pendingDecisionBar, bar_index)
+        array.push(pendingEntryPrice, close)
+        array.push(pendingAtr, math.max(atr, syminfo.mintick))
+        array.push(pendingDirection, directionCode)
+        array.push(pendingContext, contextCode)
+        array.push(pendingDirectionCode, directionCode)
+        array.push(pendingRetest, retestCode)
+        array.push(pendingSession, sessionCode)
+        array.push(pendingEvidenceMask, evidenceMask)
+        array.push(pendingCandidateId, candidateId)
+        // Holdout is intentionally separated from training by a deterministic
+        // cadence. It is never used to tune a candidate.
+        holdoutFlag = bar_index % 5 == 0
+        array.push(pendingHoldout, holdoutFlag)
+
+// -------------------------- OUTCOME RESOLUTION ------------------------------
+// Resolve only observations whose horizon has elapsed. This is the critical
+// causal alignment fix: evidence was frozen at T; outcome is computed at T+H.
+pendingN = array.size(pendingDecisionBar)
+if pendingN > 0
+    for p = pendingN - 1 to 0
+        decisionBar = array.get(pendingDecisionBar, p)
+        if bar_index - decisionBar >= validationHorizon
+            entry = array.get(pendingEntryPrice, p)
+            decisionAtr = array.get(pendingAtr, p)
+            dir = array.get(pendingDirection, p)
+            move = (close - entry) / math.max(decisionAtr, syminfo.mintick)
+            out = dir > 0 ? (move >= favorableAtr ? 1 : -1) : (move <= -favorableAtr ? 1 : -1)
+            cid = array.get(pendingCandidateId, p)
+            holdout = array.get(pendingHoldout, p)
+
+            pushMemory(array.get(pendingContext, p), array.get(pendingDirectionCode, p), array.get(pendingRetest, p), array.get(pendingSession, p), array.get(pendingEvidenceMask, p), out, cid, decisionBar, holdout)
+
+            // Update candidate training/holdout counters. Holdout is never used
+            // for promotion scoring until explicitly displayed as validation.
+            idx = array.indexof(candidateIds, cid)
+            if idx >= 0
+                if holdout
+                    hs = array.get(candidateHoldoutSamples, idx) + 1
+                    hw = array.get(candidateHoldoutWins, idx) + (out == 1 ? 1 : 0)
+                    array.set(candidateHoldoutSamples, idx, hs)
+                    array.set(candidateHoldoutWins, idx, hw)
+                else
+                    s = array.get(candidateSamples, idx) + 1
+                    w = array.get(candidateWins, idx) + (out == 1 ? 1 : 0)
+                    array.set(candidateSamples, idx, s)
+                    array.set(candidateWins, idx, w)
+
+            array.remove(pendingDecisionBar, p)
+            array.remove(pendingEntryPrice, p)
+            array.remove(pendingAtr, p)
+            array.remove(pendingDirection, p)
+            array.remove(pendingContext, p)
+            array.remove(pendingDirectionCode, p)
+            array.remove(pendingRetest, p)
+            array.remove(pendingSession, p)
+            array.remove(pendingEvidenceMask, p)
+            array.remove(pendingCandidateId, p)
+            array.remove(pendingHoldout, p)
+
+// -------------------------- COMPETITION -------------------------------------
+// Training comparison is descriptive. A candidate cannot become Champion
+// automatically because promotion is gated by Human Approval.
+championIdx = 0
+championScore = -1.0
+challengerIdx = -1
+challengerScore = -1.0
+
+for ci = 0 to array.size(candidateIds) - 1
+    s = array.get(candidateSamples, ci)
+    w = array.get(candidateWins, ci)
+    hs = array.get(candidateHoldoutSamples, ci)
+    hw = array.get(candidateHoldoutWins, ci)
+    trainRate = s > 0 ? w / s : 0.0
+    holdRate = hs > 0 ? hw / hs : 0.0
+    score = s >= competitionMin ? trainRate : -1.0
+    array.set(candidateScore, ci, score)
+    if score > championScore
+        championScore := score
+        championIdx := ci
+
+for ci = 0 to array.size(candidateIds) - 1
+    if ci != championIdx
+        s2 = array.get(candidateSamples, ci)
+        sc2 = array.get(candidateScore, ci)
+        if s2 >= competitionMin and sc2 > challengerScore
+            challengerScore := sc2
+            challengerIdx := ci
+
+if championIdx >= 0
+    array.set(candidateIsChampion, championIdx, true)
+for ci = 0 to array.size(candidateIds) - 1
+    if ci != championIdx
+        array.set(candidateIsChampion, ci, false)
+        array.set(candidateIsChallenger, ci, ci == challengerIdx)
+
+// Human Approval is the only path that can promote the research winner.
+if manualApproval and championIdx >= 0
+    array.set(candidateApproved, championIdx, true)
+
+// ----------------------------- MONITOR / ROLLBACK ----------------------------
+// Rollback is a monitored state, not a self-optimization action. The baseline
+// remains available and no parameter is mutated by this module.
+var float championBaselineRate = na
+var int championBaselineSamples = 0
+if barstate.isfirst
+    championBaselineRate := na
+
+if championIdx >= 0
+    cs = array.get(candidateSamples, championIdx)
+    cw = array.get(candidateWins, championIdx)
+    if cs >= competitionMin
+        currentChampionRate = cw / cs
+        if na(championBaselineRate)
+            championBaselineRate := currentChampionRate
+            championBaselineSamples := cs
+        if currentChampionRate < championBaselineRate - 0.20 and cs >= competitionMin * 2
+            array.set(candidateRolledBack, championIdx, true)
+
+// -------------------------- PATTERN MINING ----------------------------------
+// A pattern key is frozen from the Decision-Time context/direction/retest.
+patternKey(_c, _d, _r) => _c * 100 + (_d + 1) * 10 + _r
+currentPatternKey = patternKey(contextCode, directionCode, retestCode)
+
+patternStats(_key, _candidateFilter, _recentOnly, _interactionFilter) =>
+    int samples = 0
+    int wins = 0
+    int failures = 0
+    int n = array.size(memoryContext)
+    if n > 0
+        for i = 0 to n - 1
+            key = patternKey(array.get(memoryContext, i), array.get(memoryDirection, i), array.get(memoryRetest, i))
+            age = bar_index - array.get(memoryBar, i)
+            candidateOk = _candidateFilter == 0 or array.get(memoryCandidate, i) == _candidateFilter
+            interactionOk = _interactionFilter == -1 or array.get(memoryEvidence, i) == _interactionFilter
+            recentOk = not _recentOnly or age <= recentPatternSamples * validationHorizon
+            if key == _key and candidateOk and interactionOk and recentOk
+                samples += 1
+                o = array.get(memoryOutcome, i)
+                wins += o == 1 ? 1 : 0
+                failures += o == -1 ? 1 : 0
+    rate = samples > 0 ? wins / samples : na
+    [samples, wins, failures, rate]
+
+[sPat, wPat, fPat, patRate] = patternStats(currentPatternKey, 0, false, -1)
+[sRecentPat, wRecentPat, fRecentPat, recentPatRate] = patternStats(currentPatternKey, 0, true, -1)
+
+// Historical baseline excludes the recent sample window, making Historical vs
+// Recent explicit rather than hiding both inside one variable.
+historicalPatSamples = math.max(sPat - sRecentPat, 0)
+historicalPatWins = math.max(wPat - wRecentPat, 0)
+historicalPatRate = historicalPatSamples > 0 ? historicalPatWins / historicalPatSamples : na
+
+patternQualified = sPat >= minimumPatternSample
+patternReliable = patternQualified and not na(patRate) and patRate >= 0.70
+
+// ------------------------ CONCENTRATION / DIVERSITY -------------------------
+var int[] sessionCounts = array.from(0, 0, 0, 0)
+var int[] contextCounts = array.from(0, 0)
+var int[] directionCounts = array.from(0, 0, 0)
+
+if barstate.isconfirmed
+    // Recompute counts from immutable memory; this is research only.
+    for x = 0 to array.size(sessionCounts) - 1
+        array.set(sessionCounts, x, 0)
+    for x = 0 to array.size(contextCounts) - 1
+        array.set(contextCounts, x, 0)
+    for x = 0 to array.size(directionCounts) - 1
+        array.set(directionCounts, x, 0)
+    if array.size(memoryContext) > 0
+        for i = 0 to array.size(memoryContext) - 1
+            c = array.get(memoryContext, i)
+            d = array.get(memoryDirection, i)
+            s = array.get(memorySession, i)
+            array.set(contextCounts, c, array.get(contextCounts, c) + 1)
+            array.set(directionCounts, d + 1, array.get(directionCounts, d + 1) + 1)
+            array.set(sessionCounts, s, array.get(sessionCounts, s) + 1)
+
+memoryN = array.size(memoryContext)
+contextDiversity = (array.get(contextCounts, 0) > 0 ? 1 : 0) + (array.get(contextCounts, 1) > 0 ? 1 : 0)
+directionDiversity = (array.get(directionCounts, 0) > 0 ? 1 : 0) + (array.get(directionCounts, 1) > 0 ? 1 : 0) + (array.get(directionCounts, 2) > 0 ? 1 : 0)
+sessionDiversity = 0
+for x = 0 to 3
+    sessionDiversity += array.get(sessionCounts, x) > 0 ? 1 : 0
+
+maxSessionShare = memoryN > 0 ? math.max(math.max(array.get(sessionCounts, 0), array.get(sessionCounts, 1)), math.max(array.get(sessionCounts, 2), array.get(sessionCounts, 3))) / memoryN : 1.0
+concentration = maxSessionShare >= 0.75 ? "HIGH" : maxSessionShare >= 0.55 ? "MEDIUM" : "LOW"
+
+// ---------------------- DIRECTION / RETEST INSIGHTS -------------------------
+trendLongKey = patternKey(1, 1, 1)
+trendShortKey = patternKey(1, -1, 1)
+rangeLongKey = patternKey(0, 1, 1)
+rangeShortKey = patternKey(0, -1, 1)
+
+[stl, wtl, _, rtl] = patternStats(trendLongKey, 0, false, -1)
+[sts, wts, _, rts] = patternStats(trendShortKey, 0, false, -1)
+[srl, wrl, _, rrl] = patternStats(rangeLongKey, 0, false, -1)
+[srs, wrs, _, rrs] = patternStats(rangeShortKey, 0, false, -1)
+
+// ---------------------- GENERIC INTERACTION MINING --------------------------
+// Mine any evidence combination represented by the bitmask, rather than only
+// CVD + Delta. Pair candidates are generated from the six evidence bits.
+var interactionKeys = array.new_int()
+var interactionSamples = array.new_int()
+var interactionWins = array.new_int()
+
+if barstate.isconfirmed and array.size(memoryEvidence) > 0
+    // Seed all 15 pair interactions once.
+    if array.size(interactionKeys) == 0
+        for a = 0 to 5
+            for b = a + 1 to 5
+                pairKey = (1 << a) + (1 << b)
+                array.push(interactionKeys, pairKey)
+                array.push(interactionSamples, 0)
+                array.push(interactionWins, 0)
+    for j = 0 to array.size(interactionKeys) - 1
+        pk = array.get(interactionKeys, j)
+        sm = 0
+        wn = 0
+        for i = 0 to array.size(memoryEvidence) - 1
+            em = array.get(memoryEvidence, i)
+            contains = (em & pk) == pk
+            if contains
+                sm += 1
+                wn += array.get(memoryOutcome, i) == 1 ? 1 : 0
+        array.set(interactionSamples, j, sm)
+        array.set(interactionWins, j, wn)
+
+bestInteractionKey = 0
+bestInteractionRate = na
+bestInteractionSamples = 0
+if array.size(interactionKeys) > 0
+    for j = 0 to array.size(interactionKeys) - 1
+        sm = array.get(interactionSamples, j)
+        wn = array.get(interactionWins, j)
+        if sm >= minimumPatternSample
+            rr = wn / sm
+            if na(bestInteractionRate) or rr > bestInteractionRate
+                bestInteractionRate := rr
+                bestInteractionKey := array.get(interactionKeys, j)
+                bestInteractionSamples := sm
+
+// -------------------------- DRIFT / RECOVERY --------------------------------
+// Drift = Recent materially below Historical.
+patternDrift = patternQualified and historicalPatSamples >= minimumPatternSample and sRecentPat >= recentDriftSample and not na(historicalPatRate) and not na(recentPatRate) and recentPatRate <= historicalPatRate - recentDriftThreshold
+
+// Recovery requires a sequence: prior recent performance was degraded, while
+// the latest recent window has improved. The previous window is sampled by
+// looking at observations older than the current recent window but newer than
+// the historical baseline window.
+recoveryWindowBars = recentPatternSamples * validationHorizon
+priorWindowBars = recoveryWindowBars * 2
+priorRecentSamples = 0
+priorRecentWins = 0
+if array.size(memoryContext) > 0
+    for i = 0 to array.size(memoryContext) - 1
+        key = patternKey(array.get(memoryContext, i), array.get(memoryDirection, i), array.get(memoryRetest, i))
+        age = bar_index - array.get(memoryBar, i)
+        if key == currentPatternKey and age > recoveryWindowBars and age <= priorWindowBars
+            priorRecentSamples += 1
+            priorRecentWins += array.get(memoryOutcome, i) == 1 ? 1 : 0
+priorRecentRate = priorRecentSamples > 0 ? priorRecentWins / priorRecentSamples : na
+patternRecovery = patternQualified and sRecentPat >= recentDriftSample and priorRecentSamples >= recentDriftSample and not na(priorRecentRate) and not na(recentPatRate) and recentPatRate > priorRecentRate + 0.10
+
+patternLifecycle = patternDrift ? "DRIFT" : patternRecovery ? "RECOVERY" : patternReliable ? "RELIABLE" : sPat > 0 ? "EMERGING" : "OBSERVED"
+
+// ----------------------- RESEARCH CONFIDENCE -------------------------------
+diversityFactor = contextDiversity >= 2 and directionDiversity >= 2 and sessionDiversity >= 3 ? 1.0 : contextDiversity >= 2 and directionDiversity >= 2 ? 0.85 : 0.65
+researchConfidence = not patternQualified ? "LOW" : diversityFactor < 0.85 or concentration == "HIGH" ? "MEDIUM" : patternReliable ? "HIGH" : "MEDIUM"
+
+// ---------------------- RESEARCH RECOMMENDATION -----------------------------
+interactionRecommendation = bestInteractionSamples >= minimumPatternSample and not na(bestInteractionRate) and (na(patRate) or bestInteractionRate > patRate)
+researchRecommendation = patternDrift ? "REVIEW: Pattern drift; do not promote." : patternRecovery ? "RESEARCH: Pattern recovery; continue observation." : interactionRecommendation ? "SUGGESTED RESEARCH: Test best evidence interaction." : patternReliable ? "SUGGESTED RESEARCH: Validate current context/retest pattern." : "COLLECT MORE DATA"
+
+// ----------------------------- PANEL ----------------------------------------
+var table panel = table.new(position.top_right, 2, 20, border_width=1)
+if barstate.islast
+    championName = array.get(candidateNames, championIdx)
+    challengerName = challengerIdx >= 0 ? array.get(candidateNames, challengerIdx) : "NONE"
+    championRate = array.get(candidateSamples, championIdx) > 0 ? array.get(candidateWins, championIdx) / array.get(candidateSamples, championIdx) : na
+    holdRate = array.get(candidateHoldoutSamples, championIdx) > 0 ? array.get(candidateHoldoutWins, championIdx) / array.get(candidateHoldoutSamples, championIdx) : na
+
+    table.cell(panel, 0, 0, "AuctionAI v2.2", text_color=color.white)
+    table.cell(panel, 1, 0, "ENGINE + RESEARCH", text_color=color.white)
+    table.cell(panel, 0, 1, "Evidence / Acceptance", text_color=color.white)
+    table.cell(panel, 1, 1, str.tostring(evidenceScore) + " / FIXED", text_color=color.white)
+    table.cell(panel, 0, 2, "Registry", text_color=color.white)
+    table.cell(panel, 1, 2, str.tostring(array.size(candidateIds)) + " candidates", text_color=color.white)
+    table.cell(panel, 0, 3, "Champion", text_color=color.white)
+    table.cell(panel, 1, 3, championName, text_color=color.white)
+    table.cell(panel, 0, 4, "Champion Rate", text_color=color.white)
+    table.cell(panel, 1, 4, not na(championRate) ? str.tostring(championRate * 100, "#.0") + "%" : "N/A", text_color=color.white)
+    table.cell(panel, 0, 5, "Challenger", text_color=color.white)
+    table.cell(panel, 1, 5, challengerName, text_color=color.white)
+    table.cell(panel, 0, 6, "Holdout", text_color=color.white)
+    table.cell(panel, 1, 6, not na(holdRate) ? str.tostring(holdRate * 100, "#.0") + "%" : "N/A", text_color=color.white)
+    table.cell(panel, 0, 7, "Approval", text_color=color.white)
+    table.cell(panel, 1, 7, manualApproval ? "HUMAN ENABLED" : "WAITING", text_color=color.white)
+    table.cell(panel, 0, 8, "Pending Queue", text_color=color.white)
+    table.cell(panel, 1, 8, str.tostring(array.size(pendingDecisionBar)), text_color=color.white)
+    table.cell(panel, 0, 9, "Research Memory", text_color=color.white)
+    table.cell(panel, 1, 9, str.tostring(array.size(memoryContext)) + "/" + str.tostring(archiveLimit), text_color=color.white)
+    table.cell(panel, 0, 10, "Pattern", text_color=color.white)
+    table.cell(panel, 1, 10, contextName + " / " + directionName + " / " + retestName, text_color=color.white)
+    table.cell(panel, 0, 11, "Pattern Samples", text_color=color.white)
+    table.cell(panel, 1, 11, str.tostring(sPat), text_color=color.white)
+    table.cell(panel, 0, 12, "Historical / Recent", text_color=color.white)
+    table.cell(panel, 1, 12, not na(historicalPatRate) ? str.tostring(historicalPatRate * 100, "#.0") + "% / " + (not na(recentPatRate) ? str.tostring(recentPatRate * 100, "#.0") + "%" : "N/A") : "BUILDING", text_color=color.white)
+    table.cell(panel, 0, 13, "Lifecycle", text_color=color.white)
+    table.cell(panel, 1, 13, patternLifecycle, text_color=color.white)
+    table.cell(panel, 0, 14, "Reliability", text_color=color.white)
+    table.cell(panel, 1, 14, patternReliable ? "HIGH" : patternQualified ? "SUPPORTED" : "OBSERVED", text_color=color.white)
+    table.cell(panel, 0, 15, "Diversity / Concentration", text_color=color.white)
+    table.cell(panel, 1, 15, "C" + str.tostring(contextDiversity) + " D" + str.tostring(directionDiversity) + " T" + str.tostring(sessionDiversity) + " / " + concentration, text_color=color.white)
+    table.cell(panel, 0, 16, "Best Interaction", text_color=color.white)
+    table.cell(panel, 1, 16, bestInteractionSamples >= minimumPatternSample ? str.tostring(bestInteractionKey) + " @ " + str.tostring(bestInteractionRate * 100, "#.0") + "%" : "INSUFFICIENT", text_color=color.white)
+    table.cell(panel, 0, 17, "Research Confidence", text_color=color.white)
+    table.cell(panel, 1, 17, researchConfidence, text_color=color.white)
+    table.cell(panel, 0, 18, "Recommendation", text_color=color.white)
+    table.cell(panel, 1, 18, researchRecommendation, text_color=color.white)
+    table.cell(panel, 0, 19, "AUTO PARAMETER APPLY", text_color=color.white)
+    table.cell(panel, 1, 19, "DISABLED", text_color=color.white)
+
+plotshape(patternDrift, title="Research Pattern Drift", style=shape.circle, location=location.abovebar, size=size.tiny, color=color.orange, text="DRIFT")
+plotshape(patternRecovery, title="Research Pattern Recovery", style=shape.circle, location=location.belowbar, size=size.tiny, color=color.aqua, text="REC")
+
+alertcondition(patternDrift, "AuctionAI Research Drift", "Research-only: historical pattern performance is materially above recent performance.")
+alertcondition(patternRecovery, "AuctionAI Research Recovery", "Research-only: pattern performance is recovering.")
+alertcondition(interactionRecommendation, "AuctionAI Research Interaction", "Research-only: evidence interaction is outperforming the current pattern baseline.")
