@@ -1,0 +1,610 @@
+//@version=6
+indicator("AuctionAI v2.0 - Controlled Self-Learning", overlay=true, max_bars_back=5000)
+
+// AuctionAI v2.0
+// Controlled Self-Learning: frozen baseline -> frozen one-change candidate -> shadow evaluation -> gates -> human approval -> apply/rollback.
+// No entry, SL, TP, position sizing, execution or auto-trading.
+
+// ========================= INPUTS =========================
+validationHorizon = input.int(5, "Validation Horizon", minval=1)
+favorableThresholdAtr = input.float(0.50, "Favorable Threshold (ATR)", minval=0.0, step=0.05)
+archiveLimit = input.int(400, "Outcome Archive Size", minval=100, maxval=1000)
+researchMinSamples = input.int(50, "Research Minimum Samples", minval=20, maxval=500)
+shadowMinOutcomes = input.int(100, "Minimum Shadow Outcomes", minval=50, maxval=500)
+shadowMaxOutcomes = input.int(200, "Maximum Shadow Outcomes", minval=shadowMinOutcomes, maxval=500)
+evaluationPercent = input.int(30, "Research/OOS Evaluation %", minval=20, maxval=50)
+minImprovementPp = input.float(2.0, "Minimum Improvement (pp)", minval=0.0, step=0.5)
+maxRegressionPp = input.float(3.0, "Maximum Allowed Regression (pp)", minval=0.0, step=0.5)
+maxWeightDelta = input.int(1, "Maximum Weight Change", minval=1, maxval=1)
+stabilitySpreadPp = input.float(15.0, "Maximum Stability Spread (pp)", minval=1.0, maxval=50.0)
+driftWindow = input.int(40, "Recent Drift Window", minval=10, maxval=200)
+driftThresholdPp = input.float(10.0, "Drift Threshold (pp)", minval=1.0, step=0.5)
+learningFailureLimit = input.int(3, "Consecutive Learning Failures Before Pause", minval=1, maxval=10)
+
+// Frozen production weights.
+weightDelta = input.int(2, "Production Delta Weight", minval=-10, maxval=10)
+weightCvd = input.int(2, "Production CVD Weight", minval=-10, maxval=10)
+weightEffort = input.int(1, "Production Effort Weight", minval=-10, maxval=10)
+weightResult = input.int(1, "Production Result Weight", minval=-10, maxval=10)
+weightBody = input.int(1, "Production Strong Body Weight", minval=-10, maxval=10)
+weightBreakout = input.int(2, "Production Breakout Weight", minval=-10, maxval=10)
+weightAbsorption = input.int(-3, "Production Absorption Weight", minval=-10, maxval=10)
+
+// v1.2 -> v2.0 bridge. This represents the single recommendation selected for the current cycle.
+candidateEvidence = input.string("CVD", "v1.2 Candidate Evidence", options=["CVD", "Delta", "Effort", "Result", "Strong Body", "Breakout", "Absorption"])
+requestedCandidateDelta = input.int(1, "v1.2 Recommended Weight Delta", minval=-1, maxval=1)
+humanApproval = input.bool(false, "HUMAN APPROVAL: Apply Ready Candidate")
+manualRollback = input.bool(false, "MANUAL ROLLBACK: Restore Previous Learned Weight")
+
+// ========================= PROXIES =========================
+atr = ta.atr(14)
+atrSafe = math.max(nz(atr, syminfo.mintick), syminfo.mintick)
+barRange = high - low
+body = close - open
+volumeAvg = ta.sma(volume, 20)
+volumeSafe = math.max(nz(volumeAvg, volume), 1.0)
+deltaProxy = body / atrSafe
+cvdProxy = ta.ema(deltaProxy, 5)
+effortRatio = volume / volumeSafe
+resultRatio = math.abs(body) / atrSafe
+absorption = effortRatio > 1.5 and resultRatio < 0.35
+context = math.abs(close - nz(close[10], close)) / atrSafe > 1.5 ? "TREND" : "RANGE"
+deltaAligned = body != 0
+cvdAligned = (body > 0 and cvdProxy > 0) or (body < 0 and cvdProxy < 0)
+effortAligned = effortRatio >= 1.0
+resultAligned = body != 0 and resultRatio >= 0.5
+strongBody = barRange > atrSafe * 0.75
+breakout = close > nz(high[20], high) or close < nz(low[20], low)
+
+// ========================= HELPERS =========================
+rate(_w, _n) => _n > 0 ? _w * 100.0 / _n : na
+pp(_x) => na(_x) ? "-" : str.tostring(_x, "#.0") + " pp"
+pct(_x) => na(_x) ? "-" : str.tostring(_x, "#.0") + "%"
+
+scoreFor(_wd, _wc, _we, _wr, _wb, _wbr, _wa) =>
+    s = 0
+    s += deltaAligned ? _wd : 0
+    s += cvdAligned ? _wc : 0
+    s += effortAligned ? _we : 0
+    s += resultAligned ? _wr : 0
+    s += strongBody ? _wb : 0
+    s += breakout ? _wbr : 0
+    s += absorption ? _wa : 0
+    s
+
+directionFromScore(_score) => _score >= 3 ? 1 : _score <= -3 ? -1 : 0
+
+// ========================= BASELINE ARCHIVE =========================
+var array<int> aBar = array.new_int()
+var array<int> aDir = array.new_int()
+var array<string> aContext = array.new_string()
+var array<string> aValidation = array.new_string()
+var array<int> aQuality = array.new_int()
+var array<int> aConfidence = array.new_int()
+var array<int> aHealth = array.new_int()
+var array<bool> aRetestHold = array.new_bool()
+var array<bool> aCvd = array.new_bool()
+
+// ========================= ACTIVE BASELINE =========================
+var bool baseActive = false
+var int baseDir = 0
+var int baseStart = na
+var float baseEntry = na
+var float baseAtr = na
+
+baseScore = scoreFor(weightDelta, weightCvd, weightEffort, weightResult, weightBody, weightBreakout, weightAbsorption)
+baseCandidateDir = directionFromScore(baseScore)
+
+if not baseActive and baseCandidateDir != 0
+    baseActive := true
+    baseDir := baseCandidateDir
+    baseStart := bar_index
+    baseEntry := close
+    baseAtr := atrSafe
+
+if baseActive
+    baseBars = bar_index - baseStart
+    if baseBars >= validationHorizon
+        baseMove = (close - baseEntry) / baseAtr * baseDir
+        baseOutcome = baseMove >= favorableThresholdAtr ? "VALIDATED" : baseMove <= -favorableThresholdAtr ? "FAILED" : "NEUTRAL"
+        array.push(aBar, baseStart)
+        array.push(aDir, baseDir)
+        array.push(aContext, context)
+        array.push(aValidation, baseOutcome)
+        array.push(aQuality, math.abs(baseScore))
+        array.push(aConfidence, math.min(100, math.abs(baseScore) * 20))
+        array.push(aHealth, 100)
+        array.push(aRetestHold, baseMove > -0.25)
+        array.push(aCvd, cvdAligned)
+        while array.size(aBar) > archiveLimit
+            array.shift(aBar)
+            array.shift(aDir)
+            array.shift(aContext)
+            array.shift(aValidation)
+            array.shift(aQuality)
+            array.shift(aConfidence)
+            array.shift(aHealth)
+            array.shift(aRetestHold)
+            array.shift(aCvd)
+        baseActive := false
+
+// ========================= HISTORICAL RESEARCH / DRIFT =========================
+N = array.size(aBar)
+researchN = int(math.floor(N * (100 - evaluationPercent) / 100.0))
+oosN = N - researchN
+baseResearchW = 0
+baseOosW = 0
+recentW = 0
+recentN = math.min(N, driftWindow)
+
+if N > 0
+    for i = 0 to N - 1
+        win = array.get(aValidation, i) == "VALIDATED"
+        if i < researchN
+            baseResearchW += win ? 1 : 0
+        else
+            baseOosW += win ? 1 : 0
+        if i >= N - recentN
+            recentW += win ? 1 : 0
+
+researchRate = rate(baseResearchW, researchN)
+oosRate = rate(baseOosW, oosN)
+recentRate = rate(recentW, recentN)
+driftDetected = not na(researchRate) and not na(recentRate) and math.abs(recentRate - researchRate) >= driftThresholdPp
+
+// ========================= LEARNING CYCLE STATE =========================
+var int cycleId = 0
+var string cycleState = "IDLE"
+var string cycleStatus = "NO CANDIDATE"
+var int cycleStartBar = na
+var int cycleEvidenceDelta = 0
+var string cycleEvidence = ""
+var int cycleCandidateWeight = 0
+var int cycleBaselineWeight = 0
+var int shadowCount = 0
+var int shadowValidated = 0
+var int shadowLongN = 0
+var int shadowLongW = 0
+var int shadowShortN = 0
+var int shadowShortW = 0
+var int shadowTrendN = 0
+var int shadowTrendW = 0
+var int shadowRangeN = 0
+var int shadowRangeW = 0
+var int shadowHoldN = 0
+var int shadowHoldW = 0
+var int shadowConfidenceN = 0
+var int shadowConfidenceW = 0
+var int baseCompareN = 0
+var int baseCompareW = 0
+var int baselineLongN = 0
+var int baselineLongW = 0
+var int baselineShortN = 0
+var int baselineShortW = 0
+var int baselineTrendN = 0
+var int baselineTrendW = 0
+var int baselineRangeN = 0
+var int baselineRangeW = 0
+var int baselineHoldN = 0
+var int baselineHoldW = 0
+var int changedDecisionN = 0
+var int waitToLong = 0
+var int waitToShort = 0
+var int longToWait = 0
+var int shortToWait = 0
+var int longToShort = 0
+var int shortToLong = 0
+var int candidateSuccess = 0
+var int rejectedCandidates = 0
+var int appliedCandidates = 0
+var int rollbacks = 0
+var int consecutiveFailures = 0
+var bool learningPaused = false
+var int learnedDelta = 0
+var int learnedCvd = 0
+var int learnedEffort = 0
+var int learnedResult = 0
+var int learnedBody = 0
+var int learnedBreakout = 0
+var int learnedAbsorption = 0
+var int lastAppliedCycle = 0
+var int lastAppliedBar = na
+var array<bool> shadowWins = array.new_bool()
+
+// Auditable learning history. One row per learning cycle.
+var array<int> learningCycleIds = array.new_int()
+var array<string> learningEvidence = array.new_string()
+var array<int> learningFrom = array.new_int()
+var array<int> learningTo = array.new_int()
+var array<float> learningImprovement = array.new_float()
+var array<string> learningFinalStatus = array.new_string()
+var array<int> learningShadowN = array.new_int()
+var array<bool> learningOosPass = array.new_bool()
+var array<bool> learningRegressionFree = array.new_bool()
+
+// ========================= ACTIVE SHADOW / BASELINE PAIR =========================
+var bool shadowActive = false
+var int shadowDir = 0
+var int shadowStart = na
+var float shadowEntry = na
+var float shadowAtr = na
+var int shadowBaseDir = 0
+var int shadowBaseStart = na
+var float shadowBaseEntry = na
+var float shadowBaseAtr = na
+var string shadowCtx = "RANGE"
+var bool shadowHold = false
+var int shadowConfidence = 0
+
+if barstate.isfirst
+    learnedDelta := weightDelta
+    learnedCvd := weightCvd
+    learnedEffort := weightEffort
+    learnedResult := weightResult
+    learnedBody := weightBody
+    learnedBreakout := weightBreakout
+    learnedAbsorption := weightAbsorption
+
+// ========================= CANDIDATE CREATION =========================
+// The v1.2 recommendation is supplied as a frozen one-weight change.
+// v2.0 does not change the production inputs during shadow testing.
+requestedDelta = math.max(-maxWeightDelta, math.min(maxWeightDelta, requestedCandidateDelta))
+candidateSupported = N >= researchMinSamples and not learningPaused and cycleState == "IDLE" and not driftDetected and researchN >= researchMinSamples
+
+if candidateSupported
+    cycleId += 1
+    cycleState := "SHADOW"
+    cycleStatus := "SHADOW RUNNING"
+    cycleStartBar := bar_index
+    cycleEvidence := candidateEvidence
+    cycleEvidenceDelta := requestedDelta
+    cycleBaselineWeight := candidateEvidence == "CVD" ? learnedCvd : candidateEvidence == "Delta" ? learnedDelta : candidateEvidence == "Effort" ? learnedEffort : candidateEvidence == "Result" ? learnedResult : candidateEvidence == "Strong Body" ? learnedBody : candidateEvidence == "Breakout" ? learnedBreakout : learnedAbsorption
+    cycleCandidateWeight := cycleBaselineWeight + cycleEvidenceDelta
+    shadowCount := 0
+    shadowValidated := 0
+    shadowLongN := 0
+    shadowLongW := 0
+    shadowShortN := 0
+    shadowShortW := 0
+    shadowTrendN := 0
+    shadowTrendW := 0
+    shadowRangeN := 0
+    shadowRangeW := 0
+    shadowHoldN := 0
+    shadowHoldW := 0
+    shadowConfidenceN := 0
+    shadowConfidenceW := 0
+    baseCompareN := 0
+    baseCompareW := 0
+    baselineLongN := 0
+    baselineLongW := 0
+    baselineShortN := 0
+    baselineShortW := 0
+    baselineTrendN := 0
+    baselineTrendW := 0
+    baselineRangeN := 0
+    baselineRangeW := 0
+    baselineHoldN := 0
+    baselineHoldW := 0
+    changedDecisionN := 0
+    waitToLong := 0
+    waitToShort := 0
+    longToWait := 0
+    shortToWait := 0
+    longToShort := 0
+    shortToLong := 0
+    array.clear(shadowWins)
+
+// ========================= PARALLEL BASELINE / SHADOW =========================
+candidateWd = cycleEvidence == "Delta" ? cycleCandidateWeight : learnedDelta
+candidateWc = cycleEvidence == "CVD" ? cycleCandidateWeight : learnedCvd
+candidateWe = cycleEvidence == "Effort" ? cycleCandidateWeight : learnedEffort
+candidateWr = cycleEvidence == "Result" ? cycleCandidateWeight : learnedResult
+candidateWb = cycleEvidence == "Strong Body" ? cycleCandidateWeight : learnedBody
+candidateWbr = cycleEvidence == "Breakout" ? cycleCandidateWeight : learnedBreakout
+candidateWa = cycleEvidence == "Absorption" ? cycleCandidateWeight : learnedAbsorption
+
+if cycleState == "SHADOW" and not shadowActive and shadowCount < shadowMaxOutcomes
+    bScore = scoreFor(learnedDelta, learnedCvd, learnedEffort, learnedResult, learnedBody, learnedBreakout, learnedAbsorption)
+    sScore = scoreFor(candidateWd, candidateWc, candidateWe, candidateWr, candidateWb, candidateWbr, candidateWa)
+    bDir = directionFromScore(bScore)
+    sDir = directionFromScore(sScore)
+    if bDir != 0 or sDir != 0
+        shadowActive := true
+        shadowDir := sDir
+        shadowStart := bar_index
+        shadowEntry := close
+        shadowAtr := atrSafe
+        shadowBaseDir := bDir
+        shadowBaseStart := bar_index
+        shadowBaseEntry := close
+        shadowBaseAtr := atrSafe
+        shadowCtx := context
+        shadowHold := bScore >= 3 or sScore >= 3
+        shadowConfidence := math.min(100, math.max(math.abs(bScore), math.abs(sScore)) * 20)
+
+if cycleState == "SHADOW" and shadowActive
+    sBars = bar_index - shadowStart
+    if sBars >= validationHorizon
+        sMove = shadowDir == 0 ? 0.0 : (close - shadowEntry) / shadowAtr * shadowDir
+        bMove = shadowBaseDir == 0 ? 0.0 : (close - shadowBaseEntry) / shadowBaseAtr * shadowBaseDir
+        sWin = shadowDir != 0 and sMove >= favorableThresholdAtr
+        bWin = shadowBaseDir != 0 and bMove >= favorableThresholdAtr
+
+        shadowCount += 1
+        shadowValidated += sWin ? 1 : 0
+        array.push(shadowWins, sWin)
+        baseCompareN += 1
+        baseCompareW += bWin ? 1 : 0
+
+        if shadowDir > 0
+            shadowLongN += 1
+            shadowLongW += sWin ? 1 : 0
+        if shadowDir < 0
+            shadowShortN += 1
+            shadowShortW += sWin ? 1 : 0
+        if shadowCtx == "TREND"
+            shadowTrendN += 1
+            shadowTrendW += sWin ? 1 : 0
+        if shadowCtx == "RANGE"
+            shadowRangeN += 1
+            shadowRangeW += sWin ? 1 : 0
+        if shadowHold
+            shadowHoldN += 1
+            shadowHoldW += sWin ? 1 : 0
+        shadowConfidenceN += 1
+        shadowConfidenceW += sWin ? 1 : 0
+
+        if shadowBaseDir > 0
+            baselineLongN += 1
+            baselineLongW += bWin ? 1 : 0
+        if shadowBaseDir < 0
+            baselineShortN += 1
+            baselineShortW += bWin ? 1 : 0
+        if shadowCtx == "TREND"
+            baselineTrendN += 1
+            baselineTrendW += bWin ? 1 : 0
+        if shadowCtx == "RANGE"
+            baselineRangeN += 1
+            baselineRangeW += bWin ? 1 : 0
+        if shadowHold
+            baselineHoldN += 1
+            baselineHoldW += bWin ? 1 : 0
+
+        if shadowDir != shadowBaseDir
+            changedDecisionN += 1
+            if shadowBaseDir == 0 and shadowDir == 1
+                waitToLong += 1
+            else if shadowBaseDir == 0 and shadowDir == -1
+                waitToShort += 1
+            else if shadowBaseDir == 1 and shadowDir == 0
+                longToWait += 1
+            else if shadowBaseDir == -1 and shadowDir == 0
+                shortToWait += 1
+            else if shadowBaseDir == 1 and shadowDir == -1
+                longToShort += 1
+            else if shadowBaseDir == -1 and shadowDir == 1
+                shortToLong += 1
+
+        shadowActive := false
+
+// ========================= SHADOW GATES =========================
+shadowRate = rate(shadowValidated, shadowCount)
+baseRate = rate(baseCompareW, baseCompareN)
+improvement = not na(shadowRate) and not na(baseRate) ? shadowRate - baseRate : na
+
+// Shadow OOS: first 70% is research, last 30% is evaluation.
+shadowEvalN = int(math.floor(shadowCount * evaluationPercent / 100.0))
+shadowResearchN = shadowCount - shadowEvalN
+shadowResearchW = 0
+shadowEvalW = 0
+if shadowCount > 0
+    for si = 0 to shadowCount - 1
+        sw = array.get(shadowWins, si)
+        if si < shadowResearchN
+            shadowResearchW += sw ? 1 : 0
+        else
+            shadowEvalW += sw ? 1 : 0
+shadowResearchRate = rate(shadowResearchW, shadowResearchN)
+shadowEvalRate = rate(shadowEvalW, shadowEvalN)
+shadowOosLift = not na(shadowEvalRate) and not na(shadowResearchRate) ? shadowEvalRate - shadowResearchRate : na
+
+// Archive-period stability: three consecutive portions of the shadow archive.
+shadowB1N = 0
+shadowB1W = 0
+shadowB2N = 0
+shadowB2W = 0
+shadowB3N = 0
+shadowB3W = 0
+if shadowCount > 0
+    for si = 0 to shadowCount - 1
+        sw = array.get(shadowWins, si)
+        sb = math.min(2, int(math.floor(si * 3.0 / shadowCount)))
+        if sb == 0
+            shadowB1N += 1
+            shadowB1W += sw ? 1 : 0
+        else if sb == 1
+            shadowB2N += 1
+            shadowB2W += sw ? 1 : 0
+        else
+            shadowB3N += 1
+            shadowB3W += sw ? 1 : 0
+shadowB1Rate = rate(shadowB1W, shadowB1N)
+shadowB2Rate = rate(shadowB2W, shadowB2N)
+shadowB3Rate = rate(shadowB3W, shadowB3N)
+shadowMinRate = math.min(nz(shadowB1Rate, 0), math.min(nz(shadowB2Rate, 0), nz(shadowB3Rate, 0)))
+shadowMaxRate = math.max(nz(shadowB1Rate, 0), math.max(nz(shadowB2Rate, 0), nz(shadowB3Rate, 0)))
+shadowStabilitySpread = shadowMaxRate - shadowMinRate
+shadowStable = shadowCount >= 30 and not na(shadowB1Rate) and not na(shadowB2Rate) and not na(shadowB3Rate) and shadowStabilitySpread <= stabilitySpreadPp
+
+longShadowRate = rate(shadowLongW, shadowLongN)
+longBaseRate = rate(baselineLongW, baselineLongN)
+shortShadowRate = rate(shadowShortW, shadowShortN)
+shortBaseRate = rate(baselineShortW, baselineShortN)
+trendShadowRate = rate(shadowTrendW, shadowTrendN)
+trendBaseRate = rate(baselineTrendW, baselineTrendN)
+rangeShadowRate = rate(shadowRangeW, shadowRangeN)
+rangeBaseRate = rate(baselineRangeW, baselineRangeN)
+holdShadowRate = rate(shadowHoldW, shadowHoldN)
+holdBaseRate = rate(baselineHoldW, baselineHoldN)
+
+longRegression = not na(longShadowRate) and not na(longBaseRate) ? longShadowRate - longBaseRate < -maxRegressionPp : false
+shortRegression = not na(shortShadowRate) and not na(shortBaseRate) ? shortShadowRate - shortBaseRate < -maxRegressionPp : false
+trendRegression = not na(trendShadowRate) and not na(trendBaseRate) ? trendShadowRate - trendBaseRate < -maxRegressionPp : false
+rangeRegression = not na(rangeShadowRate) and not na(rangeBaseRate) ? rangeShadowRate - rangeBaseRate < -maxRegressionPp : false
+holdRegression = not na(holdShadowRate) and not na(holdBaseRate) ? holdShadowRate - holdBaseRate < -maxRegressionPp : false
+
+samplePass = shadowCount >= shadowMinOutcomes
+oosPass = not na(shadowOosLift) and shadowOosLift >= minImprovementPp
+directionPass = not longRegression and not shortRegression
+contextPass = not trendRegression and not rangeRegression
+retestPass = not holdRegression
+stabilityPass = shadowStable
+driftPass = not driftDetected
+regressionPass = directionPass and contextPass and retestPass
+confidencePass = shadowConfidenceN >= shadowMinOutcomes and not na(rate(shadowConfidenceW, shadowConfidenceN))
+allGatesPass = samplePass and oosPass and stabilityPass and driftPass and regressionPass and confidencePass
+candidateReady = cycleState == "SHADOW" and shadowCount >= shadowMinOutcomes
+
+if candidateReady
+    cycleState := "READY"
+    cycleStatus := allGatesPass ? "APPROVAL READY" : "REJECTED"
+    array.push(learningCycleIds, cycleId)
+    array.push(learningEvidence, cycleEvidence)
+    array.push(learningFrom, cycleBaselineWeight)
+    array.push(learningTo, cycleCandidateWeight)
+    array.push(learningImprovement, improvement)
+    array.push(learningFinalStatus, allGatesPass ? "APPROVAL READY" : "REJECTED")
+    array.push(learningShadowN, shadowCount)
+    array.push(learningOosPass, oosPass)
+    array.push(learningRegressionFree, regressionPass)
+    if not allGatesPass
+        rejectedCandidates += 1
+        consecutiveFailures += 1
+        if consecutiveFailures >= learningFailureLimit
+            learningPaused := true
+    else
+        candidateSuccess += 1
+        consecutiveFailures := 0
+
+// ========================= HUMAN APPROVAL / APPLY / ROLLBACK =========================
+// Production inputs remain the frozen baseline. Learned state is a separate state layer.
+if cycleState == "READY" and allGatesPass and humanApproval and lastAppliedCycle != cycleId
+    if cycleEvidence == "CVD"
+        learnedCvd := cycleCandidateWeight
+    else if cycleEvidence == "Delta"
+        learnedDelta := cycleCandidateWeight
+    else if cycleEvidence == "Effort"
+        learnedEffort := cycleCandidateWeight
+    else if cycleEvidence == "Result"
+        learnedResult := cycleCandidateWeight
+    else if cycleEvidence == "Strong Body"
+        learnedBody := cycleCandidateWeight
+    else if cycleEvidence == "Breakout"
+        learnedBreakout := cycleCandidateWeight
+    else
+        learnedAbsorption := cycleCandidateWeight
+    appliedCandidates += 1
+    lastAppliedCycle := cycleId
+    lastAppliedBar := bar_index
+    if array.size(learningFinalStatus) > 0
+        array.set(learningFinalStatus, array.size(learningFinalStatus) - 1, "APPLIED")
+    cycleState := "APPLIED"
+    cycleStatus := "APPLIED"
+
+if manualRollback and cycleState == "APPLIED"
+    if cycleEvidence == "CVD"
+        learnedCvd := cycleBaselineWeight
+    else if cycleEvidence == "Delta"
+        learnedDelta := cycleBaselineWeight
+    else if cycleEvidence == "Effort"
+        learnedEffort := cycleBaselineWeight
+    else if cycleEvidence == "Result"
+        learnedResult := cycleBaselineWeight
+    else if cycleEvidence == "Strong Body"
+        learnedBody := cycleBaselineWeight
+    else if cycleEvidence == "Breakout"
+        learnedBreakout := cycleBaselineWeight
+    else
+        learnedAbsorption := cycleBaselineWeight
+    rollbacks += 1
+    if array.size(learningFinalStatus) > 0
+        array.set(learningFinalStatus, array.size(learningFinalStatus) - 1, "ROLLED BACK")
+    cycleState := "ROLLBACK"
+    cycleStatus := "ROLLED BACK"
+
+// ========================= LEARNING HEALTH =========================
+totalCandidates = candidateSuccess + rejectedCandidates
+candidateSuccessRate = rate(candidateSuccess, totalCandidates)
+rollbackRate = rate(rollbacks, appliedCandidates)
+learningHealth = learningPaused ? "PAUSED" : not na(rollbackRate) and rollbackRate > 25 ? "LOW" : not na(candidateSuccessRate) and candidateSuccessRate >= 60 ? "HIGH" : "MEDIUM"
+
+// ========================= HUD =========================
+var table hud = table.new(position.top_right, 3, 22, border_width=1)
+if barstate.islast
+    table.cell(hud, 0, 0, "AUCTION AI v2.0")
+    table.cell(hud, 1, 0, "CONTROLLED SELF-LEARNING")
+    table.cell(hud, 2, 0, cycleStatus)
+    table.cell(hud, 0, 1, "Cycle")
+    table.cell(hud, 1, 1, "LC-" + str.tostring(cycleId))
+    table.cell(hud, 2, 1, cycleState)
+    table.cell(hud, 0, 2, "Candidate")
+    table.cell(hud, 1, 2, cycleEvidence == "" ? "-" : cycleEvidence)
+    table.cell(hud, 2, 2, cycleEvidence == "" ? "-" : str.tostring(cycleBaselineWeight) + " -> " + str.tostring(cycleCandidateWeight))
+    table.cell(hud, 0, 3, "Shadow")
+    table.cell(hud, 1, 3, str.tostring(shadowCount))
+    table.cell(hud, 2, 3, "Min " + str.tostring(shadowMinOutcomes))
+    table.cell(hud, 0, 4, "Baseline")
+    table.cell(hud, 1, 4, pct(baseRate))
+    table.cell(hud, 2, 4, "Shadow " + pct(shadowRate))
+    table.cell(hud, 0, 5, "Improvement")
+    table.cell(hud, 1, 5, pp(improvement))
+    table.cell(hud, 2, 5, "OOS " + pp(shadowOosLift))
+    table.cell(hud, 0, 6, "LONG")
+    table.cell(hud, 1, 6, pct(longShadowRate))
+    table.cell(hud, 2, 6, longRegression ? "REGRESSION" : "PASS")
+    table.cell(hud, 0, 7, "SHORT")
+    table.cell(hud, 1, 7, pct(shortShadowRate))
+    table.cell(hud, 2, 7, shortRegression ? "REGRESSION" : "PASS")
+    table.cell(hud, 0, 8, "TREND")
+    table.cell(hud, 1, 8, pct(trendShadowRate))
+    table.cell(hud, 2, 8, trendRegression ? "REGRESSION" : "PASS")
+    table.cell(hud, 0, 9, "RANGE")
+    table.cell(hud, 1, 9, pct(rangeShadowRate))
+    table.cell(hud, 2, 9, rangeRegression ? "REGRESSION" : "PASS")
+    table.cell(hud, 0, 10, "RETEST HOLD")
+    table.cell(hud, 1, 10, pct(holdShadowRate))
+    table.cell(hud, 2, 10, holdRegression ? "REGRESSION" : "PASS")
+    table.cell(hud, 0, 11, "Confidence")
+    table.cell(hud, 1, 11, pct(rate(shadowConfidenceW, shadowConfidenceN)))
+    table.cell(hud, 2, 11, confidencePass ? "PASS" : "FAIL")
+    table.cell(hud, 0, 12, "Stability")
+    table.cell(hud, 1, 12, stabilityPass ? "HIGH" : "LOW")
+    table.cell(hud, 2, 12, "Archive-based")
+    table.cell(hud, 0, 13, "Drift")
+    table.cell(hud, 1, 13, driftDetected ? "POSSIBLE" : "NONE")
+    table.cell(hud, 2, 13, driftPass ? "PASS" : "FREEZE")
+    table.cell(hud, 0, 14, "Regression")
+    table.cell(hud, 1, 14, regressionPass ? "NONE" : "DETECTED")
+    table.cell(hud, 2, 14, regressionPass ? "PASS" : "FAIL")
+    table.cell(hud, 0, 15, "Gates")
+    table.cell(hud, 1, 15, allGatesPass ? "ALL PASS" : "NOT PASS")
+    table.cell(hud, 2, 15, candidateReady ? cycleStatus : "RUNNING")
+    table.cell(hud, 0, 16, "Approval")
+    table.cell(hud, 1, 16, humanApproval ? "ON" : "REQUIRED")
+    table.cell(hud, 2, 16, cycleState == "READY" and allGatesPass ? "APPLY ELIGIBLE" : "-")
+    table.cell(hud, 0, 17, "Learning Health")
+    table.cell(hud, 1, 17, learningHealth)
+    table.cell(hud, 2, 17, "Rollbacks " + str.tostring(rollbacks))
+    table.cell(hud, 0, 18, "Decisions Changed")
+    table.cell(hud, 1, 18, str.tostring(changedDecisionN))
+    table.cell(hud, 2, 18, "of " + str.tostring(shadowCount))
+    table.cell(hud, 0, 19, "Drift Reference")
+    table.cell(hud, 1, 19, pct(researchRate))
+    table.cell(hud, 2, 19, "Recent " + pct(recentRate))
+    table.cell(hud, 0, 20, "Learned CVD")
+    table.cell(hud, 1, 20, str.tostring(learnedCvd))
+    table.cell(hud, 2, 20, "Production " + str.tostring(weightCvd))
+    table.cell(hud, 0, 21, "Safety")
+    table.cell(hud, 1, 21, "NO AUTO-TRADE")
+    table.cell(hud, 2, 21, "ONE WEIGHT / CYCLE")
