@@ -1,0 +1,329 @@
+//@version=6
+indicator("AuctionAI v2.2 - Adaptive Research (Non-Autonomous)", overlay=true, max_bars_back=5000)
+
+// ============================================================================
+// AuctionAI v2.2
+// Adaptive Research, NOT Adaptive Trading
+//
+// Core rule:
+//   Historical memory may produce research insights and recommendations.
+//   It MUST NOT automatically modify weights, thresholds, acceptance rules,
+//   entries, exits, stops, targets, or position sizing.
+// ============================================================================
+
+validationHorizon = input.int(5, "Validation Horizon", minval=1, maxval=50)
+favorableAtr = input.float(0.50, "Favorable Outcome (ATR)", minval=0.0, step=0.05)
+minimumPatternSample = input.int(20, "Minimum Pattern Sample", minval=20, maxval=500)
+recentWindow = input.int(20, "Recent Reliability Window", minval=10, maxval=100)
+archiveLimit = input.int(500, "Research Memory Limit", minval=100, maxval=1000)
+
+// -----------------------------------------------------------------------------
+// Stable research inputs. v2.2 observes these; it never mutates them.
+// -----------------------------------------------------------------------------
+atr = ta.atr(14)
+volumeMean = ta.sma(volume, 20)
+body = math.abs(close - open)
+range_ = high - low
+
+breakoutLong = close > ta.highest(high, 20)[1]
+breakoutShort = close < ta.lowest(low, 20)[1]
+strongBody = atr > 0 and body / atr >= 0.8
+resultDirection = close > open ? 1 : close < open ? -1 : 0
+
+deltaProxy = volume * resultDirection
+cvdProxy = ta.cum(deltaProxy)
+deltaImpulse = math.abs(deltaProxy) > volumeMean
+cvdImpulse = math.abs(cvdProxy - cvdProxy[1]) > ta.sma(math.abs(cvdProxy - cvdProxy[1]), 20)
+effort = volumeMean > 0 ? volume / volumeMean : 0.0
+absorption = range_ > 0 and body / range_ < 0.35 and volume > volumeMean * 1.25
+
+// -----------------------------------------------------------------------------
+// Candidate evidence. This remains intentionally fixed from the research spec.
+// -----------------------------------------------------------------------------
+evidenceScore = (breakoutLong or breakoutShort ? 2 : 0) +
+     (strongBody ? 1 : 0) +
+     (resultDirection != 0 ? 1 : 0) +
+     (deltaImpulse ? 2 : 0) +
+     (cvdImpulse ? 2 : 0) +
+     (effort > 1.2 ? 1 : 0) +
+     (absorption ? -3 : 0)
+
+// -----------------------------------------------------------------------------
+// Context / lifecycle classification used ONLY for pattern segmentation.
+// These labels do not alter trading decisions.
+// -----------------------------------------------------------------------------
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+trendContext = math.abs(ema20 - ema50) > atr * 0.35
+contextCode = trendContext ? 1 : 0  // 1 = TREND, 0 = RANGE
+contextName = trendContext ? "TREND" : "RANGE"
+
+directionCode = resultDirection > 0 ? 1 : resultDirection < 0 ? -1 : 0
+ directionName = directionCode > 0 ? "LONG" : directionCode < 0 ? "SHORT" : "NEUTRAL"
+
+// Retest proxy is deliberately descriptive, not an entry rule.
+level = ta.valuewhen(breakoutLong or breakoutShort, close, 0)
+retestDistance = not na(level) ? math.abs(close - level) / math.max(atr, syminfo.mintick) : na
+retestCode = not na(retestDistance) ? (retestDistance <= 0.35 ? 1 : retestDistance <= 0.80 ? 2 : 0) : 0
+retestName = retestCode == 1 ? "HOLD" : retestCode == 2 ? "RECLAIM" : "OTHER"
+
+// Session buckets provide a coarse time-diversity dimension.
+hourUtc = hour(time, "UTC")
+sessionCode = hourUtc < 8 ? 0 : hourUtc < 13 ? 1 : hourUtc < 18 ? 2 : 3
+sessionName = sessionCode == 0 ? "ASIA" : sessionCode == 1 ? "LONDON" : sessionCode == 2 ? "NY" : "OTHER"
+
+// -----------------------------------------------------------------------------
+// Outcome validation.
+// NOTE: Using close[validationHorizon] here is intentionally causal for the
+// archived outcome only when the script reaches the corresponding future bar.
+// A candidate is represented by its original evidence and its later outcome.
+// -----------------------------------------------------------------------------
+forwardMove = not na(close[validationHorizon]) ? (close - close[validationHorizon]) / math.max(atr, syminfo.mintick) : na
+outcome = resultDirection > 0 and not na(forwardMove) and forwardMove >= favorableAtr ? 1 :
+     resultDirection < 0 and not na(forwardMove) and forwardMove <= -favorableAtr ? 1 :
+     not na(forwardMove) and resultDirection != 0 ? -1 : 0
+
+// Pattern families are compact integer keys so the memory can be maintained
+// with bounded arrays inside Pine.
+patternKey = contextCode * 100 + directionCode * 10 + retestCode
+interactionKey = (deltaImpulse ? 1 : 0) * 10 + (cvdImpulse ? 1 : 0)
+
+// -----------------------------------------------------------------------------
+// Research Memory: bounded historical observations.
+// -----------------------------------------------------------------------------
+var keyMemory = array.new_int()
+var contextMemory = array.new_int()
+var directionMemory = array.new_int()
+var retestMemory = array.new_int()
+var sessionMemory = array.new_int()
+var interactionMemory = array.new_int()
+var outcomeMemory = array.new_int()
+var barMemory = array.new_int()
+
+recordObservation() =>
+    if outcome != 0 and not na(patternKey)
+        array.push(keyMemory, patternKey)
+        array.push(contextMemory, contextCode)
+        array.push(directionMemory, directionCode)
+        array.push(retestMemory, retestCode)
+        array.push(sessionMemory, sessionCode)
+        array.push(interactionMemory, interactionKey)
+        array.push(outcomeMemory, outcome)
+        array.push(barMemory, bar_index)
+        if array.size(keyMemory) > archiveLimit
+            array.shift(keyMemory)
+            array.shift(contextMemory)
+            array.shift(directionMemory)
+            array.shift(retestMemory)
+            array.shift(sessionMemory)
+            array.shift(interactionMemory)
+            array.shift(outcomeMemory)
+            array.shift(barMemory)
+
+if barstate.isconfirmed
+    recordObservation()
+
+// -----------------------------------------------------------------------------
+// Pattern analytics helpers.
+// -----------------------------------------------------------------------------
+patternStats(targetKey, recentOnly) =>
+    int samples = 0
+    int successes = 0
+    int failures = 0
+    int contextCount = 0
+    int directionCount = 0
+    int retestCount = 0
+    int sessionCount = 0
+    int lastBar = na
+    int n = array.size(keyMemory)
+    if n > 0
+        for i = 0 to n - 1
+            k = array.get(keyMemory, i)
+            b = array.get(barMemory, i)
+            eligible = k == targetKey and (not recentOnly or bar_index - b < recentWindow)
+            if eligible
+                samples += 1
+                o = array.get(outcomeMemory, i)
+                successes += o == 1 ? 1 : 0
+                failures += o == -1 ? 1 : 0
+                contextCount += 1
+                directionCount += 1
+                retestCount += 1
+                sessionCount += 1
+                lastBar := b
+    rate = samples > 0 ? successes / samples : na
+    [samples, successes, failures, rate, contextCount, directionCount, retestCount, sessionCount, lastBar]
+
+// We need explicit keys for the primary pattern families.
+trendLongHold = 1 * 100 + 1 * 10 + 1
+trendLongReclaim = 1 * 100 + 1 * 10 + 2
+trendShortHold = 1 * 100 - 1 * 10 + 1
+trendShortReclaim = 1 * 100 - 1 * 10 + 2
+rangeLongHold = 0 * 100 + 1 * 10 + 1
+rangeLongReclaim = 0 * 100 + 1 * 10 + 2
+rangeShortHold = 0 * 100 - 1 * 10 + 1
+rangeShortReclaim = 0 * 100 - 1 * 10 + 2
+
+[sTLH, wTLH, fTLH, rTLH, _, _, _, _, _] = patternStats(trendLongHold, false)
+[sTLR, wTLR, fTLR, rTLR, _, _, _, _, _] = patternStats(trendLongReclaim, false)
+[sTSH, wTSH, fTSH, rTSH, _, _, _, _, _] = patternStats(trendShortHold, false)
+[sTSR, wTSR, fTSR, rTSR, _, _, _, _, _] = patternStats(trendShortReclaim, false)
+[sRLH, wRLH, fRLH, rRLH, _, _, _, _, _] = patternStats(rangeLongHold, false)
+[sRLR, wRLR, fRLR, rRLR, _, _, _, _, _] = patternStats(rangeLongReclaim, false)
+[sRSH, wRSH, fRSH, rRSH, _, _, _, _, _] = patternStats(rangeShortHold, false)
+[sRSR, wRSR, fRSR, rRSR, _, _, _, _, _] = patternStats(rangeShortReclaim, false)
+
+// -----------------------------------------------------------------------------
+// Reliability = sample sufficiency + success + diversity + concentration.
+// A high rate with poor diversity is deliberately capped.
+// -----------------------------------------------------------------------------
+allSamples = array.size(keyMemory)
+trendSamples = 0
+rangeSamples = 0
+longSamples = 0
+shortSamples = 0
+asiaSamples = 0
+londonSamples = 0
+nySamples = 0
+otherSamples = 0
+
+if allSamples > 0
+    for i = 0 to allSamples - 1
+        c = array.get(contextMemory, i)
+        d = array.get(directionMemory, i)
+        s = array.get(sessionMemory, i)
+        trendSamples += c == 1 ? 1 : 0
+        rangeSamples += c == 0 ? 1 : 0
+        longSamples += d == 1 ? 1 : 0
+        shortSamples += d == -1 ? 1 : 0
+        asiaSamples += s == 0 ? 1 : 0
+        londonSamples += s == 1 ? 1 : 0
+        nySamples += s == 2 ? 1 : 0
+        otherSamples += s == 3 ? 1 : 0
+
+contextDiversity = (trendSamples > 0 ? 1 : 0) + (rangeSamples > 0 ? 1 : 0)
+directionDiversity = (longSamples > 0 ? 1 : 0) + (shortSamples > 0 ? 1 : 0)
+sessionDiversity = (asiaSamples > 0 ? 1 : 0) + (londonSamples > 0 ? 1 : 0) + (nySamples > 0 ? 1 : 0) + (otherSamples > 0 ? 1 : 0)
+
+maxSessionShare = allSamples > 0 ? math.max(math.max(asiaSamples, londonSamples), math.max(nySamples, otherSamples)) / allSamples : 1.0
+evidenceConcentration = maxSessionShare >= 0.75 ? "HIGH" : maxSessionShare >= 0.55 ? "MEDIUM" : "LOW"
+
+diversityFactor = contextDiversity >= 2 and directionDiversity >= 2 and sessionDiversity >= 3 ? 1.0 : contextDiversity >= 2 and directionDiversity >= 2 ? 0.85 : 0.65
+
+// The current active pattern is the pattern for the current context/direction/retest.
+currentKey = patternKey
+[sCurrent, wCurrent, fCurrent, currentRate, _, _, _, _, _] = patternStats(currentKey, false)
+[sRecent, wRecent, fRecent, recentRate, _, _, _, _, _] = patternStats(currentKey, true)
+
+sampleQualified = sCurrent >= minimumPatternSample
+baseReliability = sampleQualified and not na(currentRate) ? currentRate * diversityFactor : na
+reliability = not na(baseReliability) ? (baseReliability >= 0.70 ? "HIGH" : baseReliability >= 0.55 ? "MEDIUM" : "LOW") : "OBSERVED"
+researchConfidence = not sampleQualified ? "LOW" : diversityFactor < 0.85 ? "MEDIUM" : currentRate >= 0.70 ? "HIGH" : "MEDIUM"
+
+// -----------------------------------------------------------------------------
+// Drift / Recovery state. We compare historical and recent performance but do
+// not disable, reweight, or mutate anything.
+// -----------------------------------------------------------------------------
+driftThreshold = 0.15
+recoveryThreshold = 0.10
+hasRecent = sRecent >= minimumPatternSample
+patternDrift = sampleQualified and hasRecent and currentRate - recentRate >= driftThreshold
+patternRecovery = sampleQualified and hasRecent and not patternDrift and recentRate - currentRate >= 0 and math.abs(currentRate - recentRate) <= recoveryThreshold
+patternStatus = patternDrift ? "DRIFT" : patternRecovery ? "RECOVERY" : sampleQualified ? "RELIABLE" : sCurrent > 0 ? "EMERGING" : "OBSERVED"
+
+// -----------------------------------------------------------------------------
+// Direction / Context / Retest insights. These are research-only statements.
+// -----------------------------------------------------------------------------
+trendRate = (wTLH + wTLR + wTSH + wTSR) > 0 ? (wTLH + wTLR + wTSH + wTSR) / math.max(sTLH + sTLR + sTSH + sTSR, 1) : na
+rangeRate = (wRLH + wRLR + wRSH + wRSR) > 0 ? (wRLH + wRLR + wRSH + wRSR) / math.max(sRLH + sRLR + sRSH + sRSR, 1) : na
+longRate = (wTLH + wTLR + wRLH + wRLR) > 0 ? (wTLH + wTLR + wRLH + wRLR) / math.max(sTLH + sTLR + sRLH + sRLR, 1) : na
+shortRate = (wTSH + wTSR + wRSH + wRSR) > 0 ? (wTSH + wTSR + wRSH + wRSR) / math.max(sTSH + sTSR + sRSH + sRSR, 1) : na
+
+// Interaction mining for CVD + Delta versus single evidence.
+interactionSamples = 0
+interactionWins = 0
+cvdOnlySamples = 0
+cvdOnlyWins = 0
+deltaOnlySamples = 0
+deltaOnlyWins = 0
+
+if allSamples > 0
+    for i = 0 to allSamples - 1
+        ik = array.get(interactionMemory, i)
+        o = array.get(outcomeMemory, i)
+        if ik == 11
+            interactionSamples += 1
+            interactionWins += o == 1 ? 1 : 0
+        else if ik == 10
+            cvdOnlySamples += 1
+            cvdOnlyWins += o == 1 ? 1 : 0
+        else if ik == 1
+            deltaOnlySamples += 1
+            deltaOnlyWins += o == 1 ? 1 : 0
+
+interactionRate = interactionSamples >= minimumPatternSample ? interactionWins / interactionSamples : na
+cvdOnlyRate = cvdOnlySamples >= minimumPatternSample ? cvdOnlyWins / cvdOnlySamples : na
+deltaOnlyRate = deltaOnlySamples >= minimumPatternSample ? deltaOnlyWins / deltaOnlySamples : na
+interactionInsight = not na(interactionRate) and ((not na(cvdOnlyRate) and interactionRate > cvdOnlyRate) or (not na(deltaOnlyRate) and interactionRate > deltaOnlyRate))
+
+// -----------------------------------------------------------------------------
+// Research Recommendation. This is text only: no parameter is changed.
+// -----------------------------------------------------------------------------
+recommendation = patternDrift ?
+     "REVIEW: Pattern drift detected; retest before proposing a change." :
+     sampleQualified and interactionInsight ?
+     "SUGGESTED RESEARCH: Test CVD + Delta interaction in this context." :
+     sampleQualified and not na(currentRate) and currentRate >= 0.70 ?
+     "SUGGESTED RESEARCH: Test current evidence under this context/retest." :
+     "COLLECT MORE DATA"
+
+// -----------------------------------------------------------------------------
+// Research Memory versioning. Each confirmed observation is tagged conceptually
+// as v2.2 through the panel; historical observations remain immutable in the
+// bounded archive and are never promoted to trading parameters automatically.
+// -----------------------------------------------------------------------------
+researchMemoryVersion = "RM-v2.2"
+
+// -----------------------------------------------------------------------------
+// Visual research panel.
+// -----------------------------------------------------------------------------
+var table panel = table.new(position.top_right, 2, 15, border_width=1)
+if barstate.islast
+    table.cell(panel, 0, 0, "AuctionAI v2.2", text_color=color.white)
+    table.cell(panel, 1, 0, "ADAPTIVE RESEARCH", text_color=color.white)
+    table.cell(panel, 0, 1, "Memory", text_color=color.white)
+    table.cell(panel, 1, 1, str.tostring(allSamples) + "/" + str.tostring(archiveLimit), text_color=color.white)
+    table.cell(panel, 0, 2, "Pattern", text_color=color.white)
+    table.cell(panel, 1, 2, contextName + " / " + directionName + " / " + retestName, text_color=color.white)
+    table.cell(panel, 0, 3, "Samples", text_color=color.white)
+    table.cell(panel, 1, 3, str.tostring(sCurrent), text_color=color.white)
+    table.cell(panel, 0, 4, "Success", text_color=color.white)
+    table.cell(panel, 1, 4, not na(currentRate) ? str.tostring(currentRate * 100, "#.0") + "%" : "N/A", text_color=color.white)
+    table.cell(panel, 0, 5, "Recent", text_color=color.white)
+    table.cell(panel, 1, 5, not na(recentRate) ? str.tostring(recentRate * 100, "#.0") + "%" : "N/A", text_color=color.white)
+    table.cell(panel, 0, 6, "Reliability", text_color=color.white)
+    table.cell(panel, 1, 6, reliability, text_color=color.white)
+    table.cell(panel, 0, 7, "Research Conf.", text_color=color.white)
+    table.cell(panel, 1, 7, researchConfidence, text_color=color.white)
+    table.cell(panel, 0, 8, "Pattern Status", text_color=color.white)
+    table.cell(panel, 1, 8, patternStatus, text_color=color.white)
+    table.cell(panel, 0, 9, "Concentration", text_color=color.white)
+    table.cell(panel, 1, 9, evidenceConcentration, text_color=color.white)
+    table.cell(panel, 0, 10, "Diversity", text_color=color.white)
+    table.cell(panel, 1, 10, "C" + str.tostring(contextDiversity) + " D" + str.tostring(directionDiversity) + " T" + str.tostring(sessionDiversity), text_color=color.white)
+    table.cell(panel, 0, 11, "Interaction", text_color=color.white)
+    table.cell(panel, 1, 11, not na(interactionRate) ? str.tostring(interactionRate * 100, "#.0") + "%" : "INSUFFICIENT", text_color=color.white)
+    table.cell(panel, 0, 12, "Recommendation", text_color=color.white)
+    table.cell(panel, 1, 12, recommendation, text_color=color.white)
+    table.cell(panel, 0, 13, "Memory Version", text_color=color.white)
+    table.cell(panel, 1, 13, researchMemoryVersion, text_color=color.white)
+    table.cell(panel, 0, 14, "AUTO APPLY", text_color=color.white)
+    table.cell(panel, 1, 14, "DISABLED", text_color=color.white)
+
+// Research markers only. They do not generate entries or orders.
+plotshape(patternDrift, title="Pattern Drift", style=shape.circle, location=location.abovebar, size=size.tiny, color=color.orange, text="DRIFT")
+plotshape(patternRecovery, title="Pattern Recovery", style=shape.circle, location=location.belowbar, size=size.tiny, color=color.aqua, text="REC")
+
+alertcondition(patternDrift, "AuctionAI Pattern Drift", "Research-only alert: historical pattern reliability has drifted.")
+alertcondition(patternRecovery, "AuctionAI Pattern Recovery", "Research-only alert: pattern performance is recovering.")
+alertcondition(sampleQualified and interactionInsight, "AuctionAI Research Recommendation", "Research-only recommendation: investigate the CVD + Delta interaction.")
