@@ -11,7 +11,9 @@ favorableThresholdAtr = input.float(0.50, "Favorable Threshold (ATR)", minval=0.
 archiveLimit = input.int(400, "Outcome Archive Size", minval=100, maxval=1000)
 researchMinSamples = input.int(50, "Research Minimum Samples", minval=20, maxval=500)
 shadowMinOutcomes = input.int(100, "Minimum Shadow Outcomes", minval=50, maxval=500)
-shadowMaxOutcomes = input.int(200, "Maximum Shadow Outcomes", minval=shadowMinOutcomes, maxval=500)
+shadowMaxOutcomesInput = input.int(200, "Maximum Shadow Outcomes", minval=50, maxval=500)
+// Pine requires input.* minval/maxval to be compile-time constants. Enforce the relationship at runtime.
+shadowMaxOutcomes = math.max(shadowMinOutcomes, shadowMaxOutcomesInput)
 evaluationPercent = input.int(30, "Research/OOS Evaluation %", minval=20, maxval=50)
 minImprovementPp = input.float(2.0, "Minimum Improvement (pp)", minval=0.0, step=0.5)
 maxRegressionPp = input.float(3.0, "Maximum Allowed Regression (pp)", minval=0.0, step=0.5)
@@ -328,19 +330,15 @@ if cycleState == "SHADOW" and shadowActive
     if sBars >= validationHorizon
         sMove = shadowDir == 0 ? 0.0 : (close - shadowEntry) / shadowAtr * shadowDir
         bMove = shadowBaseDir == 0 ? 0.0 : (close - shadowBaseEntry) / shadowBaseAtr * shadowBaseDir
-        sWin = shadowDir != 0 and sMove >= favorableThresholdAtr
-        bWin = shadowBaseDir != 0 and bMove >= favorableThresholdAtr
-
+        sWin = sMove >= favorableThresholdAtr
+        bWin = bMove >= favorableThresholdAtr
+        array.push(shadowWins, sWin)
         shadowCount += 1
         shadowValidated += sWin ? 1 : 0
-        array.push(shadowWins, sWin)
-        baseCompareN += 1
-        baseCompareW += bWin ? 1 : 0
-
         if shadowDir > 0
             shadowLongN += 1
             shadowLongW += sWin ? 1 : 0
-        if shadowDir < 0
+        else if shadowDir < 0
             shadowShortN += 1
             shadowShortW += sWin ? 1 : 0
         if shadowCtx == "TREND"
@@ -353,14 +351,17 @@ if cycleState == "SHADOW" and shadowActive
             shadowHoldN += 1
             shadowHoldW += sWin ? 1 : 0
         shadowConfidenceN += 1
-        shadowConfidenceW += sWin ? 1 : 0
+        shadowConfidenceW += shadowConfidence >= 60 and sWin ? 1 : 0
 
-        if shadowBaseDir > 0
-            baselineLongN += 1
-            baselineLongW += bWin ? 1 : 0
-        if shadowBaseDir < 0
-            baselineShortN += 1
-            baselineShortW += bWin ? 1 : 0
+        if shadowBaseDir != 0
+            baseCompareN += 1
+            baseCompareW += bWin ? 1 : 0
+            if shadowBaseDir > 0
+                baselineLongN += 1
+                baselineLongW += bWin ? 1 : 0
+            else
+                baselineShortN += 1
+                baselineShortW += bWin ? 1 : 0
         if shadowCtx == "TREND"
             baselineTrendN += 1
             baselineTrendW += bWin ? 1 : 0
@@ -393,7 +394,6 @@ shadowRate = rate(shadowValidated, shadowCount)
 baseRate = rate(baseCompareW, baseCompareN)
 improvement = not na(shadowRate) and not na(baseRate) ? shadowRate - baseRate : na
 
-// Shadow OOS: first 70% is research, last 30% is evaluation.
 shadowEvalN = int(math.floor(shadowCount * evaluationPercent / 100.0))
 shadowResearchN = shadowCount - shadowEvalN
 shadowResearchW = 0
@@ -409,7 +409,6 @@ shadowResearchRate = rate(shadowResearchW, shadowResearchN)
 shadowEvalRate = rate(shadowEvalW, shadowEvalN)
 shadowOosLift = not na(shadowEvalRate) and not na(shadowResearchRate) ? shadowEvalRate - shadowResearchRate : na
 
-// Archive-period stability: three consecutive portions of the shadow archive.
 shadowB1N = 0
 shadowB1W = 0
 shadowB2N = 0
@@ -488,7 +487,6 @@ if candidateReady
         consecutiveFailures := 0
 
 // ========================= HUMAN APPROVAL / APPLY / ROLLBACK =========================
-// Production inputs remain the frozen baseline. Learned state is a separate state layer.
 if cycleState == "READY" and allGatesPass and humanApproval and lastAppliedCycle != cycleId
     if cycleEvidence == "CVD"
         learnedCvd := cycleCandidateWeight
@@ -553,7 +551,7 @@ if barstate.islast
     table.cell(hud, 2, 2, cycleEvidence == "" ? "-" : str.tostring(cycleBaselineWeight) + " -> " + str.tostring(cycleCandidateWeight))
     table.cell(hud, 0, 3, "Shadow")
     table.cell(hud, 1, 3, str.tostring(shadowCount))
-    table.cell(hud, 2, 3, "Min " + str.tostring(shadowMinOutcomes))
+    table.cell(hud, 2, 3, "Min " + str.tostring(shadowMinOutcomes) + " / Max " + str.tostring(shadowMaxOutcomes))
     table.cell(hud, 0, 4, "Baseline")
     table.cell(hud, 1, 4, pct(baseRate))
     table.cell(hud, 2, 4, "Shadow " + pct(shadowRate))
